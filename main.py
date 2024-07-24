@@ -1,5 +1,3 @@
-def say_hello(name: str):
-    print(f'Hi, {name}!')
+from prefacc.training.agents.prefppo import train as prefppo
 
-if __name__ == '__main__':
-    say_hello('pref-acc')
+prefppo.train()
