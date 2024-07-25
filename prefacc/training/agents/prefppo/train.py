@@ -29,7 +29,7 @@ import numpy as np
 import optax
 from orbax import checkpoint as ocp
 from prefacc.training import acting
-# from prefacc.training.reward_model import reward_model as reward_model_network
+from prefacc.training.reward_model import reward_model as reward_model_networks
 
 
 InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
@@ -44,7 +44,7 @@ class TrainingState:
   policy_optimizer_state: optax.OptState
   policy_params: ppo_losses.PPONetworkParams
   # reward_model_optimizer_state: optax.OptState
-  # reward_model_params: reward_model_params
+  reward_model_params: types.Params
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: jnp.ndarray
 
@@ -88,7 +88,7 @@ def train(
     network_factory: types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
-    # reward_model_factory
+    reward_model_factory = reward_model_networks.make_reward_model_network,
     progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
     normalize_advantage: bool = True,
     eval_env: Optional[envs.Env] = None,
@@ -138,6 +138,7 @@ def train(
     deterministic_eval: whether to run the eval with a deterministic policy
     network_factory: function that generates networks for policy and value
       functions
+    reward_model_factory: function that generates the reward model network
     progress_fn: a user-defined callback function for reporting/plotting metrics
     normalize_advantage: whether to normalize advantage estimate
     eval_env: an optional environment for eval only, defaults to `environment`
@@ -188,7 +189,7 @@ def train(
   local_key, key_env, eval_key = jax.random.split(local_key, 3)
   # key_networks should be global, so that networks are initialized the same
   # way for different processes.
-  key_policy, key_value = jax.random.split(global_key)
+  key_policy, key_value, key_reward_model = jax.random.split(global_key, 3)
   del global_key
 
   assert num_envs % device_count == 0
@@ -229,8 +230,9 @@ def train(
       preprocess_observations_fn=normalize)
   make_policy = ppo_networks.make_inference_fn(ppo_network)
 
-  # reward_model_network = reward_model_factory()
-  # make_reward_model = reward_model.make_reward_model_fn(reward_model_network)
+  reward_model_network = reward_model_factory(
+    env_state.obs.shape[-1],
+    env.action_size)
 
   policy_optimizer = optax.adam(learning_rate=learning_rate)
 
@@ -289,7 +291,8 @@ def train(
 
     policy = make_policy(
         (training_state.normalizer_params, training_state.policy_params.policy))
-    # reward_model = make_reward_model()
+    reward_model = reward_model_networks.make_reward_model(training_state.reward_model_params, reward_model_network)
+    print(reward_model)
 
     def f(carry, unused_t):
       current_state, current_key = carry
@@ -327,6 +330,7 @@ def train(
     new_training_state = TrainingState(
         policy_optimizer_state=policy_optimizer_state,
         policy_params=policy_params,
+        reward_model_params=training_state.reward_model_params,
         normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step)
     return (new_training_state, state, new_key), metrics
@@ -372,12 +376,12 @@ def train(
       value=ppo_network.value_network.init(key_value),
   )
 
-  # init_reward_model_params = reward_model_params
+  init_reward_model_params = reward_model_network.init(key_reward_model)
 
   training_state = TrainingState(  # pytype: disable=wrong-arg-types  # jax-ndarray
       policy_optimizer_state=policy_optimizer.init(init_policy_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
       policy_params=init_policy_params,
-      # reward_model_params=init_reward_model_params,
+      reward_model_params=init_reward_model_params,
       normalizer_params=running_statistics.init_state(
           specs.Array(env_state.obs.shape[-1:], jnp.dtype('float32'))),
       env_steps=0)
