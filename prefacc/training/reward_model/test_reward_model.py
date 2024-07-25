@@ -1,7 +1,8 @@
 """Reward model tests."""
 
 from absl.testing import absltest
-from prefacc.training.reward_model import reward_model
+import jax
+from prefacc.training.reward_model import reward_model as rm
 
 
 class RewardModelTest(absltest.TestCase):
@@ -11,8 +12,20 @@ class RewardModelTest(absltest.TestCase):
     """Test reward model creation."""
     obs_size = 3
     action_size = 2
-    model = reward_model.make_reward_model_network(obs_size, action_size)
+    model = rm.make_reward_model_network(obs_size, action_size)
     self.assertIsNotNone(model)
+
+  def testRewardModelInference(self):
+    """Test reward model inference."""
+    obs_size = 3
+    action_size = 2
+    model = rm.make_reward_model_network(obs_size, action_size)
+    params = model.init(jax.random.PRNGKey(0))
+    reward_model = rm.make_reward_model(params, model)
+    obs = jax.random.uniform(jax.random.PRNGKey(0), (1, obs_size))
+    action = jax.random.uniform(jax.random.PRNGKey(0), (1, action_size))
+    reward = reward_model(obs, action)
+    self.assertEqual(reward.shape, (1,))
 
 
 if __name__ == '__main__':
