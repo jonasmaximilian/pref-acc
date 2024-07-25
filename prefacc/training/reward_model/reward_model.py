@@ -26,13 +26,17 @@ def make_reward_model_network(
     activation=activation,
     kernel_init=jax.nn.initializers.lecun_normal())
   
-  def apply(processor_params, reward_model, params, obs, action):
-    obs = preproceess_observation_fn(obs, processor_params)
+  def apply(reward_model_params, obs, action):
     inputs = jnp.concatenate([obs, action], axis=-1)
-    return jnp.squeeze(reward_model.apply(params, inputs), axis=-1)
+    return jnp.squeeze(reward_model_module.apply(reward_model_params, inputs), axis=-1)
   
   dummy_obs = jnp.zeros((1, obs_size))
   dummy_action = jnp.zeros((1, action_size))
   dummy_input = jnp.concatenate([dummy_obs, dummy_action], axis=-1)
   return FeedForwardNetwork(
     init=lambda key: reward_model_module.init(key, dummy_input), apply=apply)
+
+def make_reward_model(params, reward_model_network) -> Callable[[types.Observation, types.Action], float]:
+  def reward_model(observations: types.Observation, actions: types.Action) -> float:
+    return reward_model_network.apply(params, observations, actions)
+  return reward_model
