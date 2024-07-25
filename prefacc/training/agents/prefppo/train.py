@@ -40,8 +40,10 @@ _PMAP_AXIS_NAME = 'i'
 @flax.struct.dataclass
 class TrainingState:
   """Contains training state for the learner."""
-  optimizer_state: optax.OptState
-  params: ppo_losses.PPONetworkParams
+  optimizer_state: optax.OptState # change to policy_optimizer_state
+  params: ppo_losses.PPONetworkParams # policy_params
+  # reward_model_optimizer_state: optax.OptState
+  # reward_model_params: reward_model_params
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: jnp.ndarray
 
@@ -225,6 +227,9 @@ def train(
       preprocess_observations_fn=normalize)
   make_policy = ppo_networks.make_inference_fn(ppo_network)
 
+  # reward_model_network = reward_model_factory()
+  # make_reward_model = reward_model.make_reward_model_fn(reward_model_network)
+
   optimizer = optax.adam(learning_rate=learning_rate)
 
   loss_fn = functools.partial(
@@ -357,14 +362,17 @@ def train(
     return training_state, env_state, metrics  # pytype: disable=bad-return-type  # py311-upgrade
 
   # Initialize model params and training state.
-  init_params = ppo_losses.PPONetworkParams(
+  init_params = ppo_losses.PPONetworkParams( # init_policy_params
       policy=ppo_network.policy_network.init(key_policy),
       value=ppo_network.value_network.init(key_value),
   )
 
+  # init_reward_model_params = reward_model_params
+
   training_state = TrainingState(  # pytype: disable=wrong-arg-types  # jax-ndarray
       optimizer_state=optimizer.init(init_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
-      params=init_params,
+      params=init_params, # policy_params
+      # reward_model_params=init_reward_model_params,
       normalizer_params=running_statistics.init_state(
           specs.Array(env_state.obs.shape[-1:], jnp.dtype('float32'))),
       env_steps=0)
