@@ -292,7 +292,6 @@ def train(
     policy = make_policy(
         (training_state.normalizer_params, training_state.policy_params.policy))
     reward_model = reward_model_networks.make_reward_model(training_state.reward_model_params, reward_model_network)
-    print(reward_model)
 
     def f(carry, unused_t):
       current_state, current_key = carry
@@ -301,6 +300,7 @@ def train(
           env,
           current_state,
           policy,
+          reward_model,
           current_key,
           unroll_length,
           extra_fields=('truncation',))

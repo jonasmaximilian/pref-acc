@@ -8,20 +8,20 @@ from brax.training.types import Metrics
 from brax.training.types import Policy
 from brax.training.types import PolicyParams
 from brax.training.types import PRNGKey
-from brax.training.types import Transition
 from brax.v1 import envs as envs_v1
 import jax
 import numpy as np
+from prefacc.training.types import Transition
 
 State = Union[envs.State, envs_v1.State]
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
 
 
-# TODO: Add reward model
 def actor_step(
     env: Env,
     env_state: State,
     policy: Policy,
+    reward_model,
     key: PRNGKey,
     extra_fields: Sequence[str] = ()
 ) -> Tuple[State, Transition]:
@@ -29,10 +29,12 @@ def actor_step(
   actions, policy_extras = policy(env_state.obs, key)
   nstate = env.step(env_state, actions)
   state_extras = {x: nstate.info[x] for x in extra_fields}
+  reward_hat = reward_model(nstate.obs, actions)
   return nstate, Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
       observation=env_state.obs,
       action=actions,
       reward=nstate.reward,
+      reward_hat=reward_hat,
       discount=1 - nstate.done,
       next_observation=nstate.obs,
       extras={
@@ -45,6 +47,7 @@ def generate_unroll(
     env: Env,
     env_state: State,
     policy: Policy,
+    reward_model,
     key: PRNGKey,
     unroll_length: int,
     extra_fields: Sequence[str] = ()
@@ -56,7 +59,7 @@ def generate_unroll(
     state, current_key = carry
     current_key, next_key = jax.random.split(current_key)
     nstate, transition = actor_step(
-        env, state, policy, current_key, extra_fields=extra_fields)
+        env, state, policy, reward_model, current_key, extra_fields=extra_fields)
     return (nstate, next_key), transition
 
   (final_state, _), data = jax.lax.scan(
