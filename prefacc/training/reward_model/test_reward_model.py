@@ -11,8 +11,7 @@ class RewardModelTest(absltest.TestCase):
     """Test reward model creation."""
     obs_size = 3
     action_size = 2
-    # model = reward_model.make_reward_network(obs_size, action_size)
-    model = reward_model.make_reward_network(obs_size, action_size)
+    model = reward_model.make_reward_model_network(obs_size, action_size)
     self.assertIsNotNone(model)
 
 
