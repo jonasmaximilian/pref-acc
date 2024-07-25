@@ -29,6 +29,7 @@ import numpy as np
 import optax
 from orbax import checkpoint as ocp
 from prefacc.training import acting
+# from prefacc.training.reward_model import reward_model as reward_model_network
 
 
 InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
@@ -40,8 +41,8 @@ _PMAP_AXIS_NAME = 'i'
 @flax.struct.dataclass
 class TrainingState:
   """Contains training state for the learner."""
-  optimizer_state: optax.OptState # change to policy_optimizer_state
-  params: ppo_losses.PPONetworkParams # policy_params
+  policy_optimizer_state: optax.OptState
+  policy_params: ppo_losses.PPONetworkParams
   # reward_model_optimizer_state: optax.OptState
   # reward_model_params: reward_model_params
   normalizer_params: running_statistics.RunningStatisticsState
@@ -87,6 +88,7 @@ def train(
     network_factory: types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
+    # reward_model_factory
     progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
     normalize_advantage: bool = True,
     eval_env: Optional[envs.Env] = None,
@@ -143,10 +145,10 @@ def train(
       saving policy checkpoints
     randomization_fn: a user-defined callback function that generates randomized
       environments
-    restore_checkpoint_path: the path used to restore previous model params
+    restore_checkpoint_path: the path used to restore previous model policy_params
 
   Returns:
-    Tuple of (make_policy function, network params, metrics)
+    Tuple of (make_policy function, network policy_params, metrics)
   """
   assert batch_size * num_minibatches % num_envs == 0
   xt = time.time()
@@ -230,9 +232,9 @@ def train(
   # reward_model_network = reward_model_factory()
   # make_reward_model = reward_model.make_reward_model_fn(reward_model_network)
 
-  optimizer = optax.adam(learning_rate=learning_rate)
+  policy_optimizer = optax.adam(learning_rate=learning_rate)
 
-  loss_fn = functools.partial(
+  policy_loss = functools.partial( # policy_loss
       ppo_losses.compute_ppo_loss,
       ppo_network=ppo_network,
       entropy_cost=entropy_cost,
@@ -241,27 +243,29 @@ def train(
       gae_lambda=gae_lambda,
       clipping_epsilon=clipping_epsilon,
       normalize_advantage=normalize_advantage)
+  # reward_loss
 
-  gradient_update_fn = gradients.gradient_update_fn(
-      loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
+  policy_update = gradients.gradient_update_fn(
+      policy_loss, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
+  # reward update
 
   def minibatch_step(
       carry, data: types.Transition,
       normalizer_params: running_statistics.RunningStatisticsState):
-    optimizer_state, params, key = carry
+    policy_optimizer_state, policy_params, key = carry
     key, key_loss = jax.random.split(key)
-    (_, metrics), params, optimizer_state = gradient_update_fn(
-        params,
+    (_, metrics), policy_params, policy_optimizer_state = policy_update(
+        policy_params,
         normalizer_params,
         data,
         key_loss,
-        optimizer_state=optimizer_state)
+        optimizer_state=policy_optimizer_state)
 
-    return (optimizer_state, params, key), metrics
+    return (policy_optimizer_state, policy_params, key), metrics
 
   def sgd_step(carry, unused_t, data: types.Transition,
                normalizer_params: running_statistics.RunningStatisticsState):
-    optimizer_state, params, key = carry
+    policy_optimizer_state, policy_params, key = carry
     key, key_perm, key_grad = jax.random.split(key, 3)
 
     def convert_data(x: jnp.ndarray):
@@ -270,12 +274,12 @@ def train(
       return x
 
     shuffled_data = jax.tree_util.tree_map(convert_data, data)
-    (optimizer_state, params, _), metrics = jax.lax.scan(
+    (policy_optimizer_state, policy_params, _), metrics = jax.lax.scan(
         functools.partial(minibatch_step, normalizer_params=normalizer_params),
-        (optimizer_state, params, key_grad),
+        (policy_optimizer_state, policy_params, key_grad),
         shuffled_data,
         length=num_minibatches)
-    return (optimizer_state, params, key), metrics
+    return (policy_optimizer_state, policy_params, key), metrics
 
   def training_step(
       carry: Tuple[TrainingState, envs.State, PRNGKey],
@@ -284,7 +288,8 @@ def train(
     key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
 
     policy = make_policy(
-        (training_state.normalizer_params, training_state.params.policy))
+        (training_state.normalizer_params, training_state.policy_params.policy))
+    # reward_model = make_reward_model()
 
     def f(carry, unused_t):
       current_state, current_key = carry
@@ -307,21 +312,21 @@ def train(
                                   data)
     assert data.discount.shape[1:] == (unroll_length,)
 
-    # Update normalization params and normalize observations.
+    # Update normalization policy_params and normalize observations.
     normalizer_params = running_statistics.update(
         training_state.normalizer_params,
         data.observation,
         pmap_axis_name=_PMAP_AXIS_NAME)
 
-    (optimizer_state, params, _), metrics = jax.lax.scan(
+    (policy_optimizer_state, policy_params, _), metrics = jax.lax.scan(
         functools.partial(
             sgd_step, data=data, normalizer_params=normalizer_params),
-        (training_state.optimizer_state, training_state.params, key_sgd), (),
+        (training_state.policy_optimizer_state, training_state.policy_params, key_sgd), (),
         length=num_updates_per_batch)
 
     new_training_state = TrainingState(
-        optimizer_state=optimizer_state,
-        params=params,
+        policy_optimizer_state=policy_optimizer_state,
+        policy_params=policy_params,
         normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step)
     return (new_training_state, state, new_key), metrics
@@ -361,8 +366,8 @@ def train(
     }
     return training_state, env_state, metrics  # pytype: disable=bad-return-type  # py311-upgrade
 
-  # Initialize model params and training state.
-  init_params = ppo_losses.PPONetworkParams( # init_policy_params
+  # Initialize policy params and training state.
+  init_policy_params = ppo_losses.PPONetworkParams(
       policy=ppo_network.policy_network.init(key_policy),
       value=ppo_network.value_network.init(key_value),
   )
@@ -370,8 +375,8 @@ def train(
   # init_reward_model_params = reward_model_params
 
   training_state = TrainingState(  # pytype: disable=wrong-arg-types  # jax-ndarray
-      optimizer_state=optimizer.init(init_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
-      params=init_params, # policy_params
+      policy_optimizer_state=policy_optimizer.init(init_policy_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
+      policy_params=init_policy_params,
       # reward_model_params=init_reward_model_params,
       normalizer_params=running_statistics.init_state(
           specs.Array(env_state.obs.shape[-1:], jnp.dtype('float32'))),
@@ -380,7 +385,7 @@ def train(
   if num_timesteps == 0:
     return (
         make_policy,
-        (training_state.normalizer_params, training_state.params),
+        (training_state.normalizer_params, training_state.policy_params),
         {},
     )
 
@@ -390,12 +395,12 @@ def train(
   ):
     logging.info('restoring from checkpoint %s', restore_checkpoint_path)
     orbax_checkpointer = ocp.PyTreeCheckpointer()
-    target = training_state.normalizer_params, init_params
-    (normalizer_params, init_params) = orbax_checkpointer.restore(
+    target = training_state.normalizer_params, init_policy_params
+    (normalizer_params, init_policy_params) = orbax_checkpointer.restore(
         restore_checkpoint_path, item=target
     )
     training_state = training_state.replace(
-        normalizer_params=normalizer_params, params=init_params
+        normalizer_params=normalizer_params, policy_params=init_policy_params
     )
 
   training_state = jax.device_put_replicated(
@@ -428,7 +433,7 @@ def train(
   if process_id == 0 and num_evals > 1:
     metrics = evaluator.run_evaluation(
         _unpmap(
-            (training_state.normalizer_params, training_state.params.policy)),
+            (training_state.normalizer_params, training_state.policy_params.policy)),
         training_metrics={})
     logging.info(metrics)
     progress_fn(0, metrics)
@@ -458,14 +463,14 @@ def train(
       # Run evals.
       metrics = evaluator.run_evaluation(
           _unpmap(
-              (training_state.normalizer_params, training_state.params.policy)),
+              (training_state.normalizer_params, training_state.policy_params.policy)),
           training_metrics)
       logging.info(metrics)
       progress_fn(current_step, metrics)
-      params = _unpmap(
-          (training_state.normalizer_params, training_state.params)
+      policy_params = _unpmap(
+          (training_state.normalizer_params, training_state.policy_params)
       )
-      policy_params_fn(current_step, make_policy, params)
+      policy_params_fn(current_step, make_policy, policy_params)
 
   total_steps = current_step
   assert total_steps >= num_timesteps
@@ -473,8 +478,8 @@ def train(
   # If there was no mistakes the training_state should still be identical on all
   # devices.
   pmap.assert_is_replicated(training_state)
-  params = _unpmap(
-      (training_state.normalizer_params, training_state.params.policy))
+  policy_params = _unpmap(
+      (training_state.normalizer_params, training_state.policy_params.policy))
   logging.info('total steps: %s', total_steps)
   pmap.synchronize_hosts()
-  return (make_policy, params, metrics)
+  return (make_policy, policy_params, metrics)
