@@ -12,7 +12,7 @@ import jax.numpy as jnp
 ActivationFn = Callable[[jnp.ndarray], jnp.ndarray]
 
 
-def make_reward_network(
+def make_reward_model_network(
     obs_size: int,
     action_size: int,
     preproceess_observation_fn:
