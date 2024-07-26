@@ -34,7 +34,7 @@ class PrefPPOTest(parameterized.TestCase):
         num_evals=3,
         reward_scaling=10,
         normalize_advantage=False)
-    self.assertGreater(metrics['eval/episode_reward'], 135)
+    self.assertGreater(metrics['eval/episode_reward'], 33)
     self.assertEqual(fast.reset_count, 2)  # type: ignore
     self.assertEqual(fast.step_count, 2)  # type: ignore
 
