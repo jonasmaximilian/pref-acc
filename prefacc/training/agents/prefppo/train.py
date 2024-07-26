@@ -1,6 +1,6 @@
-"""Proximal policy optimization training.
+"""Preference-based proximal policy optimization (PrefPPO) training.
 
-See: https://arxiv.org/pdf/1707.06347.pdf
+See: https://arxiv.org/abs/2111.03026
 """
 
 import functools
@@ -43,7 +43,6 @@ class TrainingState:
   """Contains training state for the learner."""
   policy_optimizer_state: optax.OptState
   policy_params: ppo_losses.PPONetworkParams
-  # reward_model_optimizer_state: optax.OptState
   reward_model_params: types.Params
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: jnp.ndarray
@@ -98,7 +97,7 @@ def train(
     ] = None,
     restore_checkpoint_path: Optional[str] = None,
 ):
-  """PPO training.
+  """PrefPPO training.
 
   Args:
     environment: the environment to train
@@ -236,7 +235,7 @@ def train(
 
   policy_optimizer = optax.adam(learning_rate=learning_rate)
 
-  policy_loss = functools.partial( # policy_loss
+  policy_loss = functools.partial(
       ppo_losses.compute_ppo_loss,
       ppo_network=ppo_network,
       entropy_cost=entropy_cost,
@@ -245,11 +244,9 @@ def train(
       gae_lambda=gae_lambda,
       clipping_epsilon=clipping_epsilon,
       normalize_advantage=normalize_advantage)
-  # reward_loss
 
   policy_update = gradients.gradient_update_fn(
       policy_loss, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
-  # reward update
 
   def minibatch_step(
       carry, data: types.Transition,
@@ -460,7 +457,6 @@ def train(
       key_envs = jax.vmap(
           lambda x, s: jax.random.split(x[0], s),
           in_axes=(0, None))(key_envs, key_envs.shape[1])
-      # TODO: move extra reset logic to the AutoResetWrapper.
       env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
 
     if process_id == 0:
