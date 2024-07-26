@@ -1,12 +1,9 @@
-"""PrefAcc training acting functions."""
+"""pref-acc training acting functions."""
 
-import time
-from typing import Callable, Sequence, Tuple, Union
+from typing import Sequence, Tuple, Union
 
 from brax import envs
-from brax.training.types import Metrics
 from brax.training.types import Policy
-from brax.training.types import PolicyParams
 from brax.training.types import PRNGKey
 from brax.v1 import envs as envs_v1
 import jax
