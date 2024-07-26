@@ -15,9 +15,6 @@ ActivationFn = Callable[[jnp.ndarray], jnp.ndarray]
 def make_reward_model_network(
     obs_size: int,
     action_size: int,
-    preproceess_observation_fn:
-    types.PreprocessObservationFn = types.
-    identity_observation_preprocessor,
     hidden_layer_sizes: Sequence[int] = (256, 256),
     activation: ActivationFn = linen.relu
 ) -> FeedForwardNetwork:
