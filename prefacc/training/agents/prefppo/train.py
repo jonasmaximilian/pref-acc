@@ -13,7 +13,8 @@ from brax import envs
 from brax.training.acting import Evaluator
 from brax.training import gradients
 from brax.training import pmap
-from brax.training import types
+from brax.training import replay_buffers
+from brax.training import types as brax_types
 from brax.training.acme import running_statistics
 from brax.training.acme import specs
 from brax.training.agents.ppo import losses as ppo_losses
@@ -29,11 +30,12 @@ import numpy as np
 import optax
 from orbax import checkpoint as ocp
 from prefacc.training import acting
+from prefacc.training import types as prefacc_types
 from prefacc.training.reward_model import reward_model as reward_model_networks
 
 
 InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
-Metrics = types.Metrics
+Metrics = brax_types.Metrics
 
 _PMAP_AXIS_NAME = 'i'
 
@@ -43,7 +45,7 @@ class TrainingState:
   """Contains training state for the learner."""
   policy_optimizer_state: optax.OptState
   policy_params: ppo_losses.PPONetworkParams
-  reward_model_params: types.Params
+  reward_model_params: brax_types.Params
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: jnp.ndarray
 
@@ -54,7 +56,7 @@ def _unpmap(v):
 
 def _strip_weak_type(tree):
   # brax user code is sometimes ambiguous about weak_type.  in order to
-  # avoid extra jit recompilations we strip all weak types from user input
+  # avoid extra jit recompilations we strip all weak brax_types from user input
   def f(leaf):
     leaf = jnp.asarray(leaf)
     return leaf.astype(leaf.dtype)
@@ -84,7 +86,7 @@ def train(
     clipping_epsilon: float = 0.3,
     gae_lambda: float = 0.95,
     deterministic_eval: bool = False,
-    network_factory: types.NetworkFactory[
+    network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
     reward_model_factory = reward_model_networks.make_reward_model_network,
@@ -249,7 +251,7 @@ def train(
       policy_loss, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
 
   def minibatch_step(
-      carry, data: types.Transition,
+      carry, data: brax_types.Transition,
       normalizer_params: running_statistics.RunningStatisticsState):
     policy_optimizer_state, policy_params, key = carry
     key, key_loss = jax.random.split(key)
@@ -262,7 +264,7 @@ def train(
 
     return (policy_optimizer_state, policy_params, key), metrics
 
-  def sgd_step(carry, unused_t, data: types.Transition,
+  def sgd_step(carry, unused_t, data: brax_types.Transition,
                normalizer_params: running_statistics.RunningStatisticsState):
     policy_optimizer_state, policy_params, key = carry
     key, key_perm, key_grad = jax.random.split(key, 3)
@@ -375,8 +377,8 @@ def train(
 
   init_reward_model_params = reward_model_network.init(key_reward_model)
 
-  training_state = TrainingState(  # pytype: disable=wrong-arg-types  # jax-ndarray
-      policy_optimizer_state=policy_optimizer.init(init_policy_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
+  training_state = TrainingState(  # pytype: disable=wrong-arg-brax_types  # jax-ndarray
+      policy_optimizer_state=policy_optimizer.init(init_policy_params),  # pytype: disable=wrong-arg-brax_types  # numpy-scalars
       policy_params=init_policy_params,
       reward_model_params=init_reward_model_params,
       normalizer_params=running_statistics.init_state(
