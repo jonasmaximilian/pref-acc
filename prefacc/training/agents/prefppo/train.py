@@ -85,6 +85,9 @@ def train(
     reward_scaling: float = 1.0,
     clipping_epsilon: float = 0.3,
     gae_lambda: float = 0.95,
+    min_replay_size: int = 0,
+    max_replay_size: Optional[int] = None,
+    grad_updates_per_step: int = 1,
     deterministic_eval: bool = False,
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
@@ -167,6 +170,13 @@ def train(
       process_id, local_device_count, local_devices_to_use)
   device_count = local_devices_to_use * process_count
 
+  if min_replay_size >= num_timesteps:
+    raise ValueError(
+        'No training will happen because min_replay_size >= num_timesteps')
+  
+  if max_replay_size is None:
+    max_replay_size = num_timesteps
+
   # The number of environment steps executed for every training step.
   env_step_per_training_step = (
       batch_size * unroll_length * num_minibatches * action_repeat)
@@ -187,7 +197,7 @@ def train(
   global_key, local_key = jax.random.split(key)
   del key
   local_key = jax.random.fold_in(local_key, process_id)
-  local_key, key_env, eval_key = jax.random.split(local_key, 3)
+  local_key, rb_key, key_env, eval_key = jax.random.split(local_key, 4)
   # key_networks should be global, so that networks are initialized the same
   # way for different processes.
   key_policy, key_value, key_reward_model = jax.random.split(global_key, 3)
@@ -222,6 +232,9 @@ def train(
                          (local_devices_to_use, -1) + key_envs.shape[1:])
   env_state = reset_fn(key_envs)
 
+  obs_size = env.observation_size
+  action_size = env.action_size
+
   normalize = lambda x, y: x
   if normalize_observations:
     normalize = running_statistics.normalize
@@ -236,6 +249,30 @@ def train(
     env.action_size)
 
   policy_optimizer = optax.adam(learning_rate=learning_rate)
+
+  dummy_obs = jnp.zeros((obs_size,))
+  dummy_action = jnp.zeros((action_size,))
+  dummy_transition = prefacc_types.Transition(
+      observation=dummy_obs,
+      action=dummy_action,
+      reward=0.,
+      reward_hat=0.,
+      discount=0.,
+      next_observation=dummy_obs,
+      extras={
+        'state_extras': {
+            'truncation': 0.
+        },
+        'policy_extras': {
+            'log_prob': 0.,
+            'raw_action': jnp.zeros((action_size,))
+        }
+    })
+  
+  replay_buffer = replay_buffers.UniformSamplingQueue(
+      max_replay_size=max_replay_size // device_count,
+      dummy_data_sample=dummy_transition,
+      sample_batch_size=batch_size * grad_updates_per_step // device_count) # 2 or 2 * num_prefs
 
   policy_loss = functools.partial(
       ppo_losses.compute_ppo_loss,
@@ -409,6 +446,14 @@ def train(
   training_state = jax.device_put_replicated(
       training_state,
       jax.local_devices()[:local_devices_to_use])
+  
+  # Replay buffer init
+  buffer_state = jax.pmap(replay_buffer.init)(
+      jax.random.split(rb_key, local_devices_to_use))
+  # buffer_state = replay_buffer.init(rb_key)
+  # buffer_state = jax.device_put_replicated(
+  #   buffer_state,
+  #   jax.local_devices()[:local_devices_to_use])
 
   if not eval_env:
     eval_env = environment
