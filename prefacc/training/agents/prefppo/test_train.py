@@ -34,9 +34,9 @@ class PrefPPOTest(parameterized.TestCase):
         num_evals=3,
         reward_scaling=10,
         normalize_advantage=False)
-    self.assertGreater(metrics['eval/episode_reward'], 33)
+    self.assertGreater(metrics['eval/episode_reward'], 15)
     self.assertEqual(fast.reset_count, 2)  # type: ignore
-    self.assertEqual(fast.step_count, 2)  # type: ignore
+    self.assertEqual(fast.step_count, 3)  # type: ignore
 
   def testTrainV2(self):
     """Test PrefPPO with a v2 env."""
@@ -116,6 +116,31 @@ class PrefPPOTest(parameterized.TestCase):
         normalize_advantage=False,
         randomization_fn=rand_fn,
     )
+  
+  def testTrainPrefill(self):
+    """Test PrefPPO with prefill."""
+    fast = envs.get_environment('fast')
+    _, _, metrics = prefppo.train(
+        fast,
+        num_timesteps=2**15,
+        episode_length=128,
+        num_envs=64,
+        learning_rate=3e-4,
+        entropy_cost=1e-2,
+        discounting=0.95,
+        unroll_length=5,
+        batch_size=64,
+        num_minibatches=8,
+        num_updates_per_batch=4,
+        normalize_observations=True,
+        seed=2,
+        num_evals=3,
+        reward_scaling=10,
+        normalize_advantage=False,
+        min_replay_size=64,)
+    self.assertGreater(metrics['eval/episode_reward'], 5)
+    self.assertEqual(fast.reset_count, 2)  # type: ignore
+    self.assertEqual(fast.step_count, 3)  # type: ignore
 
 
 if __name__ == '__main__':

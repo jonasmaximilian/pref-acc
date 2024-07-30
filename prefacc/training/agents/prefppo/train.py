@@ -5,7 +5,7 @@ See: https://arxiv.org/abs/2111.03026
 
 import functools
 import time
-from typing import Callable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple, Union
 
 from absl import logging
 from brax import base
@@ -36,6 +36,8 @@ from prefacc.training.reward_model import reward_model as reward_model_networks
 
 InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
 Metrics = brax_types.Metrics
+
+ReplayBufferState = Any
 
 _PMAP_AXIS_NAME = 'i'
 
@@ -177,6 +179,8 @@ def train(
   if max_replay_size is None:
     max_replay_size = num_timesteps
 
+  num_prefill_actor_steps = -(-min_replay_size // num_envs)
+
   # The number of environment steps executed for every training step.
   env_step_per_training_step = (
       batch_size * unroll_length * num_minibatches * action_repeat)
@@ -272,7 +276,7 @@ def train(
   replay_buffer = replay_buffers.UniformSamplingQueue(
       max_replay_size=max_replay_size // device_count,
       dummy_data_sample=dummy_transition,
-      sample_batch_size=batch_size * grad_updates_per_step // device_count) # 2 or 2 * num_prefs
+      sample_batch_size=1) # 2 or 2 * num_prefs
 
   policy_loss = functools.partial(
       ppo_losses.compute_ppo_loss,
@@ -318,6 +322,25 @@ def train(
         shuffled_data,
         length=num_minibatches)
     return (policy_optimizer_state, policy_params, key), metrics
+  
+  def get_experience(
+      normalizer_params: running_statistics.RunningStatisticsState,
+      policy_params: Params, reward_model_params: Params, env_state: Union[envs.State, envs_v1.State],
+      buffer_state: ReplayBufferState, key: PRNGKey
+  ) -> Tuple[running_statistics.RunningStatisticsState,
+             Union[envs.State, envs_v1.State], ReplayBufferState]:
+    policy = make_policy((normalizer_params, policy_params))
+    reward_model = reward_model_networks.make_reward_model(reward_model_params, reward_model_network)
+    env_state, transitions = acting.actor_step(
+        env, env_state, policy, reward_model, key, extra_fields=('truncation',))
+    
+    normalizer_params = running_statistics.update(
+        normalizer_params,
+        transitions.observation,
+        pmap_axis_name=_PMAP_AXIS_NAME)
+    
+    buffer_state = replay_buffer.insert(buffer_state, transitions)
+    return normalizer_params, env_state, buffer_state
 
   def training_step(
       carry: Tuple[TrainingState, envs.State, PRNGKey],
@@ -370,6 +393,30 @@ def train(
         normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step)
     return (new_training_state, state, new_key), metrics
+  
+  def prefill_replay_buffer(
+      training_state: TrainingState, env_state: envs.State,
+      buffer_state: ReplayBufferState, key: PRNGKey
+  ) -> Tuple[TrainingState, envs.State, ReplayBufferState, PRNGKey]:
+    def f(carry, unused):
+      del unused
+      training_state, env_state, buffer_state, key = carry
+      key, new_key = jax.random.split(key)
+      new_normalizer_params, env_state, buffer_state = get_experience(
+          training_state.normalizer_params, training_state.policy_params.policy,
+          training_state.reward_model_params, env_state, buffer_state, key)
+      new_training_state = training_state.replace(
+          normalizer_params=new_normalizer_params,
+          env_steps=training_state.env_steps + 1)
+      return (new_training_state, env_state, buffer_state, new_key), ()
+    
+    return jax.lax.scan(
+        f, (training_state, env_state, buffer_state, key), (),
+        length=num_prefill_actor_steps)[0]
+      
+
+  prefill_replay_buffer = jax.pmap(
+      prefill_replay_buffer, axis_name=_PMAP_AXIS_NAME)
 
   def training_epoch(training_state: TrainingState, state: envs.State,
                      key: PRNGKey) -> Tuple[TrainingState, envs.State, Metrics]:
@@ -485,7 +532,20 @@ def train(
         training_metrics={})
     logging.info(metrics)
     progress_fn(0, metrics)
+  
+  prefill_key, local_key = jax.random.split(local_key)
+  prefill_keys = jax.random.split(prefill_key, local_devices_to_use)
+  training_state, env_state, buffer_state, _ = prefill_replay_buffer(
+      training_state, env_state, buffer_state, prefill_keys)
+  
+  replay_size = jnp.sum(jax.vmap(
+      replay_buffer.size)(buffer_state)) * jax.process_count()
+  logging.info('replay size after prefill: %s', replay_size)
+  assert replay_size >= min_replay_size
 
+  samples = jax.vmap(replay_buffer.sample)(buffer_state)
+  logging.info('samples: %s', samples)
+ 
   training_metrics = {}
   training_walltime = 0
   current_step = 0
