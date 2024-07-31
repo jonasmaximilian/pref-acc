@@ -31,6 +31,7 @@ import optax
 from orbax import checkpoint as ocp
 from prefacc.training import acting
 from prefacc.training import types as prefacc_types
+from prefacc.training.replay_buffers import RandomSamplingQueue
 from prefacc.training.reward_model import reward_model as reward_model_networks
 
 
@@ -273,10 +274,15 @@ def train(
         }
     })
   
-  replay_buffer = replay_buffers.UniformSamplingQueue(
+  # replay_buffer = replay_buffers.UniformSamplingQueue(
+  #     max_replay_size=max_replay_size // device_count,
+  #     dummy_data_sample=dummy_transition,
+  #     sample_batch_size=min_replay_size) # 2 or 2 * num_prefs
+
+  replay_buffer = RandomSamplingQueue(
       max_replay_size=max_replay_size // device_count,
       dummy_data_sample=dummy_transition,
-      sample_batch_size=1) # 2 or 2 * num_prefs
+      sample_batch_size=min_replay_size // 2) # 2 or 2 * num_prefs
 
   policy_loss = functools.partial(
       ppo_losses.compute_ppo_loss,
@@ -543,8 +549,13 @@ def train(
   logging.info('replay size after prefill: %s', replay_size)
   assert replay_size >= min_replay_size
 
-  samples = jax.vmap(replay_buffer.sample)(buffer_state)
-  logging.info('samples: %s', samples)
+  # samples = jax.vmap(replay_buffer.sample)(buffer_state)
+  # logging.info('samples: %s', samples)
+
+  buffer_state, transitions1 = jax.vmap(replay_buffer.sample)(buffer_state)
+  buffer_state, transitions2 = jax.vmap(replay_buffer.sample)(buffer_state)
+  logging.info('transitions 1: %s', transitions1)
+  logging.info('transitions 2: %s', transitions2)
  
   training_metrics = {}
   training_walltime = 0
