@@ -5,7 +5,7 @@ See: https://arxiv.org/abs/2111.03026
 
 import functools
 import time
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
 from absl import logging
 from brax import base
@@ -39,6 +39,7 @@ InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
 Metrics = brax_types.Metrics
 
 ReplayBufferState = Any
+State = Union[envs.State, envs_v1.State]
 
 _PMAP_AXIS_NAME = 'i'
 
@@ -282,7 +283,8 @@ def train(
   replay_buffer = RandomSamplingQueue(
       max_replay_size=max_replay_size // device_count,
       dummy_data_sample=dummy_transition,
-      sample_batch_size=min_replay_size // 2) # 2 or 2 * num_prefs
+      sample_batch_size=min_replay_size // 2) # 2 or 2 * num_prefs: This is the length of the segments
+                                              # e.g. 4 would be 4 steps long
 
   policy_loss = functools.partial(
       ppo_losses.compute_ppo_loss,
@@ -347,6 +349,30 @@ def train(
     
     buffer_state = replay_buffer.insert(buffer_state, transitions)
     return normalizer_params, env_state, buffer_state
+  
+  def unroll_and_insert(env: Union[envs.Env, envs_v1.Env, envs_v1.Wrapper],
+                        env_state: State,
+                        policy: brax_types.Policy,
+                        reward_model,
+                        buffer_state: ReplayBufferState,
+                        key: PRNGKey,
+                        unroll_length: int,
+                        extra_fields: Sequence[str] = ()
+                        ) -> Tuple[State, ReplayBufferState, prefacc_types.Transition]:
+    
+    @jax.jit
+    def f(carry, unused_t):
+      state, buffer_state, current_key = carry
+      current_key, next_key = jax.random.split(current_key)
+      nstate, transition = acting.actor_step(
+          env, state, policy, reward_model, current_key, extra_fields=extra_fields)
+      buffer_state = replay_buffer.insert(buffer_state, transition)
+      return (nstate, buffer_state, next_key), transition
+
+    (final_state, buffer_state, _), data = jax.lax.scan(
+        f, (env_state, buffer_state, key), (), length=unroll_length
+    )
+    return (final_state, buffer_state), data
 
   def training_step(
       carry: Tuple[TrainingState, envs.State, ReplayBufferState, PRNGKey],
@@ -361,19 +387,16 @@ def train(
     def f(carry, unused_t):
       current_state, buffer_state, current_key = carry
       current_key, next_key = jax.random.split(current_key)
-      next_state, data = acting.generate_unroll(
+      (next_state, buffer_state), data = unroll_and_insert(
           env,
           current_state,
           policy,
           reward_model,
+          buffer_state,
           current_key,
           unroll_length,
           extra_fields=('truncation',))
-      # TODO
-      # split into single steps 
-      # for traj in data 
-      # map insert into replay buffer
-      # OR rewrite generate_unroll in this file and call insert_buffer after actor_step
+
       return (next_state, buffer_state, next_key), data
 
     (state, buffer_state, _), data = jax.lax.scan(
