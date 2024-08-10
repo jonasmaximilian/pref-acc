@@ -274,17 +274,13 @@ def train(
             'raw_action': jnp.zeros((action_size,))
         }
     })
-  
-  # replay_buffer = replay_buffers.UniformSamplingQueue(
-  #     max_replay_size=max_replay_size // device_count,
-  #     dummy_data_sample=dummy_transition,
-  #     sample_batch_size=min_replay_size) # 2 or 2 * num_prefs
 
   replay_buffer = RandomSamplingQueue(
       max_replay_size=max_replay_size // device_count,
       dummy_data_sample=dummy_transition,
       sample_batch_size=min_replay_size // 2) # 2 or 2 * num_prefs: This is the length of the segments
                                               # e.g. 4 would be 4 steps long
+                                              # this should be the number of preference_pairs * 2
 
   policy_loss = functools.partial(
       ppo_losses.compute_ppo_loss,
@@ -577,8 +573,14 @@ def train(
   logging.info('replay size after prefill: %s', replay_size)
   assert replay_size >= min_replay_size
 
-  # samples = jax.vmap(replay_buffer.sample)(buffer_state)
-  # logging.info('samples: %s', samples)
+  # buffer_state, samples = jax.vmap(replay_buffer.sample)(buffer_state)
+  # # logging.info('samples: %s', samples)
+  # # log reward, reward_hat
+  # logging.info('reward: %s', samples.reward)
+  # buffer_state, samples2 = jax.vmap(replay_buffer.sample)(buffer_state)
+  # logging.info('reward: %s', samples2.reward)
+  # buffer_state, samples3 = jax.vmap(replay_buffer.sample)(buffer_state)
+  # logging.info('reward: %s', samples3.reward)
 
   # buffer_state, transitions1 = jax.vmap(replay_buffer.sample)(buffer_state)
   # buffer_state, transitions2 = jax.vmap(replay_buffer.sample)(buffer_state)
@@ -620,6 +622,11 @@ def train(
 
   total_steps = current_step
   assert total_steps >= num_timesteps
+
+  replay_size = jnp.sum(jax.vmap(
+      replay_buffer.size)(buffer_state)) * jax.process_count()
+  
+  logging.info('replay size at end: %s', replay_size)
 
   # If there was no mistakes the training_state should still be identical on all
   # devices.
