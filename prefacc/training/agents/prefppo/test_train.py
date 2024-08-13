@@ -119,7 +119,7 @@ class PrefPPOTest(parameterized.TestCase):
   
   def testTrainBuffer(self):
     """Test PrefPPO with prefill."""
-    fast = envs.get_environment('ant', backend='positional')
+    fast = envs.get_environment('inverted_pendulum', backend='spring')
     _, _, metrics = prefppo.train(
         fast,
         num_timesteps=2**15,
