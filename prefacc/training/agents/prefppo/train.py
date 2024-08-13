@@ -93,6 +93,7 @@ def train(
     max_replay_size: Optional[int] = None,
     grad_updates_per_step: int = 1,
     deterministic_eval: bool = False,
+    num_prefs: int = 4, # This is for testing atm, should be then used to calc num_prefs_per_training_step
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
@@ -482,6 +483,68 @@ def train(
         **{f'training/{name}': value for name, value in metrics.items()}
     }
     return training_state, env_state, buffer_state, metrics  # pytype: disable=bad-return-type  # py311-upgrade
+  
+  def training_reward_model(
+      training_state: TrainingState, buffer_state: ReplayBufferState
+  ) -> Tuple[TrainingState, ReplayBufferState, Metrics]:
+      
+      def f(carry, unused):
+          buffer_state = carry
+          buffer_state, segment1 = jax.vmap(replay_buffer.sample)(buffer_state)
+          buffer_state, segment2 = jax.vmap(replay_buffer.sample)(buffer_state)
+
+          segment1 = jax.tree_util.tree_map(
+              lambda x: jnp.reshape(x, (grad_updates_per_step, -1) + x.shape[1:]),
+              segment1)
+          segment2 = jax.tree_util.tree_map(
+              lambda x: jnp.reshape(x, (grad_updates_per_step, -1) + x.shape[1:]),
+              segment2)
+
+          # segment1 = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), segment1)
+          # segment2 = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), segment2)
+          # segment1 = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+          #                               segment1)
+          # segment2 = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+          #                               segment2)
+          # elict preference P(s1 > s2)
+
+          summed_reward_s1 = jnp.sum(segment1.reward)
+          summed_reward_s2 = jnp.sum(segment2.reward)
+          pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: (1, 0), lambda _: (0, 1), ())
+          
+          # pref_pair = prefacc_types.PreferencePair(segment1, segment2, label)
+          pref_pair = prefacc_types.PreferencePair(segment1, segment2, pref)
+          return (buffer_state), pref_pair
+
+      # generate preference pairs
+      (buffer_state), pref_data = jax.lax.scan(
+          f, (buffer_state), (), length=num_prefs)
+
+      # (training_state, _), metrics = jax.lax.scan(
+      #     rm_sgd_step, (training_state, training_key), pref_data)
+    #       data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
+    # data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+    #                               data)
+
+      logging.info(('pref_data: %s', pref_data))
+
+      # calculate loss for every single preference pair and stack them up
+      # this should maybe go to reward_model/losses.py
+      # the mean of these losses should be the final loss
+      # if this is in losses.py define a loss function loss_rm and use it in gradients.gradient_update_fn
+      def g(carry, pref_pair):
+          training_state = carry
+          pref_data = pref_pair
+          jax.debug.print("🤯 {x} 🤯", x=pref_data)
+          # calculate loss on pref_data
+          # loss = calculate_loss(pref_data)
+          # return _, losses
+          return training_state, pref_data
+
+      _, metrics = jax.lax.scan(
+          g, (training_state), pref_data)
+
+      return training_state, buffer_state, _
 
   # Initialize policy params and training state.
   init_policy_params = ppo_losses.PPONetworkParams(
@@ -573,7 +636,14 @@ def train(
   logging.info('replay size after prefill: %s', replay_size)
   assert replay_size >= min_replay_size
 
+  # train reward model
+  if replay_size >= num_prefs:
+    training_state, buffer_state, metrics = training_reward_model(
+        training_state, buffer_state)
+
   # buffer_state, samples = jax.vmap(replay_buffer.sample)(buffer_state)
+  # summed_reward = jnp.sum(samples.reward)
+  # logging.info('summed reward: %s', summed_reward)
   # # logging.info('samples: %s', samples)
   # # log reward, reward_hat
   # logging.info('reward: %s', samples.reward)

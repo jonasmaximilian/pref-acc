@@ -14,3 +14,10 @@ class Transition(NamedTuple):
   discount: NestedArray
   next_observation: NestedArray
   extras: NestedArray = ()  # pytype: disable=annotation-type-mismatch  # jax-ndarray
+
+
+class PreferencePair(NamedTuple):
+  """Container for a preference pair."""
+  segment1: Transition
+  segment2: Transition
+  preference: NestedArray
