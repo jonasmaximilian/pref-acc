@@ -94,7 +94,7 @@ def train(
     max_replay_size: Optional[int] = None,
     grad_updates_per_step: int = 1,
     deterministic_eval: bool = False,
-    num_prefs: int = 4, # This is for testing atm, should be then used to calc num_prefs_per_training_step
+    num_prefs: int = 700, # This is for testing atm, should be then used to calc num_prefs_per_training_step
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
@@ -180,10 +180,11 @@ def train(
     raise ValueError(
         'No training will happen because min_replay_size >= num_timesteps')
   
-  if max_replay_size is None:
-    max_replay_size = num_timesteps
+  # if max_replay_size is None:
+  #   max_replay_size = num_timesteps
 
   num_prefill_actor_steps = -(-min_replay_size // num_envs)
+  num_prefs_per_epoch = num_prefs // num_evals 
 
   # The number of environment steps executed for every training step.
   env_step_per_training_step = (
@@ -200,6 +201,9 @@ def train(
           * max(num_resets_per_eval, 1)
       )
   ).astype(int)
+
+  max_replay_size = max_replay_size or env_step_per_training_step
+  logging.info('max_replay_size: %s', max_replay_size)
 
   key = jax.random.PRNGKey(seed)
   global_key, local_key = jax.random.split(key)
@@ -265,7 +269,7 @@ def train(
       observation=dummy_obs,
       action=dummy_action,
       reward=0.,
-      reward_hat=0.,
+      true_reward=0.,
       discount=0.,
       next_observation=dummy_obs,
       extras={
@@ -513,8 +517,8 @@ def train(
               lambda x: jnp.reshape(x, (grad_updates_per_step, -1) + x.shape[1:]),
               segment2)
 
-          summed_reward_s1 = jnp.sum(segment1.reward)
-          summed_reward_s2 = jnp.sum(segment2.reward)
+          summed_reward_s1 = jnp.sum(segment1.true_reward)
+          summed_reward_s2 = jnp.sum(segment2.true_reward)
           pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
           
           # pref_pair = prefacc_types.PreferencePair(segment1, segment2, label)
@@ -523,7 +527,7 @@ def train(
 
       # generate preference pairs
       (buffer_state), pref_data = jax.lax.scan(
-          f, (buffer_state), (), length=num_prefs)
+          f, (buffer_state), (), length=num_prefs_per_epoch)
       
       # calc and apply loss
 

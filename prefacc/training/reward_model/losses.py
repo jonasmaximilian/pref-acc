@@ -20,8 +20,8 @@ def compute_reward_model_loss(
     # calculate loss for a single pair
     def f(carry, pref_pair):
         _ = carry
-        reward_hat_s1 = jnp.sum(pref_pair.segment1.reward_hat)
-        reward_hat_s2 = jnp.sum(pref_pair.segment2.reward_hat)
+        reward_hat_s1 = jnp.sum(pref_pair.segment1.reward)
+        reward_hat_s2 = jnp.sum(pref_pair.segment2.reward)
 
         # probability that s1 is preferred over s2 (bradley terry model)
         prob_s1 = jnp.exp(reward_hat_s1) // jnp.exp(reward_hat_s1) + jnp.exp(reward_hat_s2)
