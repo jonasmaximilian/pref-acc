@@ -13,7 +13,6 @@ from brax import envs
 from brax.training.acting import Evaluator
 from brax.training import gradients
 from brax.training import pmap
-from brax.training import replay_buffers
 from brax.training import types as brax_types
 from brax.training.acme import running_statistics
 from brax.training.acme import specs
@@ -32,6 +31,7 @@ from orbax import checkpoint as ocp
 from prefacc.training import acting
 from prefacc.training import types as prefacc_types
 from prefacc.training.replay_buffers import RandomSamplingQueue
+from prefacc.training.reward_model import losses as rm_losses
 from prefacc.training.reward_model import reward_model as reward_model_networks
 
 
@@ -49,6 +49,7 @@ class TrainingState:
   """Contains training state for the learner."""
   policy_optimizer_state: optax.OptState
   policy_params: ppo_losses.PPONetworkParams
+  reward_model_optimizer_state: optax.OptState
   reward_model_params: brax_types.Params
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: jnp.ndarray
@@ -256,6 +257,7 @@ def train(
     env.action_size)
 
   policy_optimizer = optax.adam(learning_rate=learning_rate)
+  reward_model_optimizer = optax.adam(learning_rate=learning_rate) # add this to the training_state
 
   dummy_obs = jnp.zeros((obs_size,))
   dummy_action = jnp.zeros((action_size,))
@@ -292,9 +294,16 @@ def train(
       gae_lambda=gae_lambda,
       clipping_epsilon=clipping_epsilon,
       normalize_advantage=normalize_advantage)
+  
+  reward_model_loss = functools.partial(
+      rm_losses.compute_reward_model_loss)
 
   policy_update = gradients.gradient_update_fn(
       policy_loss, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
+  
+  reward_model_update = gradients.gradient_update_fn(
+      reward_model_loss, reward_model_optimizer, pmap_axis_name=_PMAP_AXIS_NAME)  
+  
 
   def minibatch_step(
       carry, data: brax_types.Transition,
@@ -420,6 +429,7 @@ def train(
     new_training_state = TrainingState(
         policy_optimizer_state=policy_optimizer_state,
         policy_params=policy_params,
+        reward_model_optimizer_state=training_state.reward_model_optimizer_state,
         reward_model_params=training_state.reward_model_params,
         normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step)
@@ -490,9 +500,12 @@ def train(
       
       def f(carry, unused):
           buffer_state = carry
-          buffer_state, segment1 = jax.vmap(replay_buffer.sample)(buffer_state)
-          buffer_state, segment2 = jax.vmap(replay_buffer.sample)(buffer_state)
+          # buffer_state, segment1 = jax.vmap(replay_buffer.sample)(buffer_state)
+          # buffer_state, segment2 = jax.vmap(replay_buffer.sample)(buffer_state)
+          buffer_state, segment1 = replay_buffer.sample(buffer_state)
+          buffer_state, segment2 = replay_buffer.sample(buffer_state)
 
+          # idk if this works if grad_updates_per_step != 1
           segment1 = jax.tree_util.tree_map(
               lambda x: jnp.reshape(x, (grad_updates_per_step, -1) + x.shape[1:]),
               segment1)
@@ -500,17 +513,9 @@ def train(
               lambda x: jnp.reshape(x, (grad_updates_per_step, -1) + x.shape[1:]),
               segment2)
 
-          # segment1 = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), segment1)
-          # segment2 = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), segment2)
-          # segment1 = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
-          #                               segment1)
-          # segment2 = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
-          #                               segment2)
-          # elict preference P(s1 > s2)
-
           summed_reward_s1 = jnp.sum(segment1.reward)
           summed_reward_s2 = jnp.sum(segment2.reward)
-          pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: (1, 0), lambda _: (0, 1), ())
+          pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
           
           # pref_pair = prefacc_types.PreferencePair(segment1, segment2, label)
           pref_pair = prefacc_types.PreferencePair(segment1, segment2, pref)
@@ -519,32 +524,23 @@ def train(
       # generate preference pairs
       (buffer_state), pref_data = jax.lax.scan(
           f, (buffer_state), (), length=num_prefs)
+      
+      # calc and apply loss
 
-      # (training_state, _), metrics = jax.lax.scan(
-      #     rm_sgd_step, (training_state, training_key), pref_data)
-    #       data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
-    # data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
-    #                               data)
+      rm_loss, rm_params, rm_optimizer_state = reward_model_update(training_state.reward_model_params, pref_data, optimizer_state=training_state.reward_model_optimizer_state)
 
-      logging.info(('pref_data: %s', pref_data))
+      # loss, _ = rm_losses.compute_reward_model_loss(pref_data)
+      # jax.debug.print("😭 {x} 😭", x=loss)
 
-      # calculate loss for every single preference pair and stack them up
-      # this should maybe go to reward_model/losses.py
-      # the mean of these losses should be the final loss
-      # if this is in losses.py define a loss function loss_rm and use it in gradients.gradient_update_fn
-      def g(carry, pref_pair):
-          training_state = carry
-          pref_data = pref_pair
-          jax.debug.print("🤯 {x} 🤯", x=pref_data)
-          # calculate loss on pref_data
-          # loss = calculate_loss(pref_data)
-          # return _, losses
-          return training_state, pref_data
+      logging.info("Done training rm!!!")
 
-      _, metrics = jax.lax.scan(
-          g, (training_state), pref_data)
+      new_training_state = training_state.replace(
+          reward_model_params=rm_params,
+          reward_model_optimizer_state=rm_optimizer_state)
 
-      return training_state, buffer_state, _
+      return (new_training_state, buffer_state), metrics
+  
+  training_reward_model = jax.pmap(training_reward_model,axis_name=_PMAP_AXIS_NAME)
 
   # Initialize policy params and training state.
   init_policy_params = ppo_losses.PPONetworkParams(
@@ -557,6 +553,7 @@ def train(
   training_state = TrainingState(  # pytype: disable=wrong-arg-brax_types  # jax-ndarray
       policy_optimizer_state=policy_optimizer.init(init_policy_params),  # pytype: disable=wrong-arg-brax_types  # numpy-scalars
       policy_params=init_policy_params,
+      reward_model_optimizer_state=reward_model_optimizer.init(init_reward_model_params),
       reward_model_params=init_reward_model_params,
       normalizer_params=running_statistics.init_state(
           specs.Array(env_state.obs.shape[-1:], jnp.dtype('float32'))),
@@ -638,7 +635,7 @@ def train(
 
   # train reward model
   if replay_size >= num_prefs:
-    training_state, buffer_state, metrics = training_reward_model(
+    (training_state, buffer_state), metrics = training_reward_model(
         training_state, buffer_state)
 
   # buffer_state, samples = jax.vmap(replay_buffer.sample)(buffer_state)
@@ -676,6 +673,9 @@ def train(
           lambda x, s: jax.random.split(x[0], s),
           in_axes=(0, None))(key_envs, key_envs.shape[1])
       env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
+
+      (training_state, buffer_state), metrics = training_reward_model(
+        training_state, buffer_state)
 
     if process_id == 0:
       # Run evals.
