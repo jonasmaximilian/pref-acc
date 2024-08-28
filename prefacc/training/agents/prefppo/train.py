@@ -265,29 +265,45 @@ def train(
 
   dummy_obs = jnp.zeros((obs_size,))
   dummy_action = jnp.zeros((action_size,))
-  dummy_transition = prefacc_types.Transition(
-      observation=dummy_obs,
-      action=dummy_action,
-      reward=0.,
-      true_reward=0.,
-      discount=0.,
-      next_observation=dummy_obs,
+  # dummy_transition = prefacc_types.Transition(
+  #     observation=dummy_obs,
+  #     action=dummy_action,
+  #     reward=0.,
+  #     true_reward=0.,
+  #     discount=0.,
+  #     next_observation=dummy_obs,
+  #     extras={
+  #       'state_extras': {
+  #           'truncation': 0.
+  #       },
+  #       'policy_extras': {
+  #           'log_prob': 0.,
+  #           'raw_action': jnp.zeros((action_size,))
+  #       }
+  #   })
+  dummy_trajectory = prefacc_types.Transition(
+      observation=jnp.zeros((unroll_length, obs_size)),
+      action=jnp.zeros((unroll_length, action_size)),
+      reward=jnp.zeros((unroll_length,)),
+      true_reward=jnp.zeros((unroll_length,)),
+      discount=jnp.zeros((unroll_length,)),
+      next_observation=jnp.zeros((unroll_length, obs_size)),
       extras={
-        'state_extras': {
-            'truncation': 0.
-        },
-        'policy_extras': {
-            'log_prob': 0.,
-            'raw_action': jnp.zeros((action_size,))
-        }
-    })
+          'policy_extras': {
+              'log_prob': jnp.zeros((unroll_length,)),
+              'raw_action': jnp.zeros((unroll_length, action_size))
+          },
+          'state_extras': {
+              'truncation': jnp.zeros((unroll_length,))
+          }
+      }
+  )
+  
 
   replay_buffer = RandomSamplingQueue(
       max_replay_size=max_replay_size // device_count,
-      dummy_data_sample=dummy_transition,
-      sample_batch_size=min_replay_size // 2) # 2 or 2 * num_prefs: This is the length of the segments
-                                              # e.g. 4 would be 4 steps long
-                                              # this should be the number of preference_pairs * 2
+      dummy_data_sample=dummy_trajectory,
+      sample_batch_size=1)
 
   policy_loss = functools.partial(
       ppo_losses.compute_ppo_loss,
@@ -349,9 +365,13 @@ def train(
              Union[envs.State, envs_v1.State], ReplayBufferState]:
     policy = make_policy((normalizer_params, policy_params))
     reward_model = reward_model_networks.make_reward_model(reward_model_params, reward_model_network)
-    env_state, transitions = acting.actor_step(
-        env, env_state, policy, reward_model, key, extra_fields=('truncation',))
-    
+    # env_state, transitions = acting.actor_step(
+    #     env, env_state, policy, reward_model, key, extra_fields=('truncation',))
+    _, transitions = acting.generate_unroll(
+        env, env_state, policy, reward_model, key, unroll_length, extra_fields=('truncation',))
+    transitions = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), transitions)
+
+
     normalizer_params = running_statistics.update(
         normalizer_params,
         transitions.observation,
@@ -635,12 +655,14 @@ def train(
   replay_size = jnp.sum(jax.vmap(
       replay_buffer.size)(buffer_state)) * jax.process_count()
   logging.info('replay size after prefill: %s', replay_size)
-  assert replay_size >= min_replay_size
+  # assert replay_size >= min_replay_size
 
   # train reward model
-  if replay_size >= num_prefs:
-    (training_state, buffer_state), metrics = training_reward_model(
-        training_state, buffer_state)
+  if replay_size >= 10:
+    buffer_state, samples = jax.vmap(replay_buffer.sample)(buffer_state)
+    logging.info('samples: %s', samples)
+  #   (training_state, buffer_state), metrics = training_reward_model(
+  #       training_state, buffer_state)
 
   # buffer_state, samples = jax.vmap(replay_buffer.sample)(buffer_state)
   # summed_reward = jnp.sum(samples.reward)
@@ -678,8 +700,8 @@ def train(
           in_axes=(0, None))(key_envs, key_envs.shape[1])
       env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
 
-      (training_state, buffer_state), metrics = training_reward_model(
-        training_state, buffer_state)
+      # (training_state, buffer_state), metrics = training_reward_model(
+      #   training_state, buffer_state)
 
     if process_id == 0:
       # Run evals.

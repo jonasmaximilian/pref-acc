@@ -25,10 +25,11 @@ class RandomSamplingQueue(QueueBase[Sample], Generic[Sample]):
           f'not match the shape of the buffer state ({buffer_state.data.shape}).')
     
     key, sample_key = jax.random.split(buffer_state.key)
-    random_idx = jax.random.randint(sample_key, (1,), 0, buffer_state.insert_position - self._sample_batch_size)[0]
-
-    idx = (jnp.arange(self._sample_batch_size)) + random_idx
-
-    flat_batch = jnp.take(buffer_state.data, idx, axis=0)
-
-    return buffer_state.replace(key=key), self._unflatten_fn(flat_batch)
+    idx = jax.random.randint(
+        sample_key,
+        (self._sample_batch_size,),
+        minval=buffer_state.sample_position,
+        maxval=buffer_state.insert_position,
+    )
+    batch = jnp.take(buffer_state.data, idx, axis=0, mode='wrap')
+    return buffer_state.replace(key=key), self._unflatten_fn(batch)
