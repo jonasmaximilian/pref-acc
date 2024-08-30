@@ -88,13 +88,14 @@ def train(
     num_resets_per_eval: int = 0,
     normalize_observations: bool = False,
     reward_scaling: float = 1.0,
-    clipping_epsilon: float = 0.3,
+    clipping_epsilon: float = 0.3, # 0.3
     gae_lambda: float = 0.95,
     min_replay_size: int = 0,
     max_replay_size: Optional[int] = None,
     grad_updates_per_step: int = 1,
     deterministic_eval: bool = False,
-    num_prefs: int = 700, # This is for testing atm, should be then used to calc num_prefs_per_training_step
+    segment_size: int = 50,
+    num_prefs: int = 2000, # This is for testing atm, should be then used to calc num_prefs_per_training_step
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
@@ -176,6 +177,13 @@ def train(
       process_id, local_device_count, local_devices_to_use)
   device_count = local_devices_to_use * process_count
 
+  # Calculate min_replay_size as a fraction of num_timesteps
+  min_replay_size = max(int(0.05 * num_timesteps), batch_size * unroll_length)
+  
+  # Ensure min_replay_size is at least batch_size * unroll_length
+  min_replay_size = max(min_replay_size, batch_size * unroll_length)
+  logging.info(f'Minimum replay size: {min_replay_size}')
+
   if min_replay_size >= num_timesteps:
     raise ValueError(
         'No training will happen because min_replay_size >= num_timesteps')
@@ -184,7 +192,9 @@ def train(
   #   max_replay_size = num_timesteps
 
   num_prefill_actor_steps = -(-min_replay_size // num_envs)
+  logging.info(f'Number of prefill actor steps: {num_prefill_actor_steps}')
   num_prefs_per_epoch = num_prefs // num_evals 
+  logging.info(f'Number of prefs per epoch: {num_prefs_per_epoch}')
 
   # The number of environment steps executed for every training step.
   env_step_per_training_step = (
@@ -261,7 +271,7 @@ def train(
     env.action_size)
 
   policy_optimizer = optax.adam(learning_rate=learning_rate)
-  reward_model_optimizer = optax.adam(learning_rate=learning_rate) # add this to the training_state
+  reward_model_optimizer = optax.adam(learning_rate=0.0005)
 
   dummy_obs = jnp.zeros((obs_size,))
   dummy_action = jnp.zeros((action_size,))
@@ -285,9 +295,7 @@ def train(
   replay_buffer = RandomSamplingQueue(
       max_replay_size=max_replay_size // device_count,
       dummy_data_sample=dummy_transition,
-      sample_batch_size=min_replay_size // 2) # 2 or 2 * num_prefs: This is the length of the segments
-                                              # e.g. 4 would be 4 steps long
-                                              # this should be the number of preference_pairs * 2
+      sample_batch_size=segment_size) # This is the length of the segments
 
   policy_loss = functools.partial(
       ppo_losses.compute_ppo_loss,
@@ -409,7 +417,7 @@ def train(
 
       return (next_state, buffer_state, next_key), data
 
-    (state, buffer_state, _), data = jax.lax.scan(
+    (state, buffer_state, key_generate_unroll), data = jax.lax.scan(
         f, (state, buffer_state, key_generate_unroll), (),
         length=batch_size * num_minibatches // num_envs)
     # Have leading dimensions (batch_size * num_minibatches, unroll_length)
@@ -504,8 +512,6 @@ def train(
       
       def f(carry, unused):
           buffer_state = carry
-          # buffer_state, segment1 = jax.vmap(replay_buffer.sample)(buffer_state)
-          # buffer_state, segment2 = jax.vmap(replay_buffer.sample)(buffer_state)
           buffer_state, segment1 = replay_buffer.sample(buffer_state)
           buffer_state, segment2 = replay_buffer.sample(buffer_state)
 
@@ -546,6 +552,17 @@ def train(
   
   training_reward_model = jax.pmap(training_reward_model,axis_name=_PMAP_AXIS_NAME)
 
+  def calculate_pearson_correlation(training_state, buffer_state):
+      buffer_state, batch = replay_buffer.sample(buffer_state)
+
+      policy = make_policy((training_state.normalizer_params, training_state.policy_params.policy))
+      reward_model = reward_model_networks.make_reward_model(training_state.reward_model_params, reward_model_network)
+
+      correlation = jnp.corrcoef(batch.true_reward, batch.reward)[0, 1]
+      return correlation
+  
+  calculate_pearson_correlation = jax.pmap(calculate_pearson_correlation, axis_name=_PMAP_AXIS_NAME)
+  
   # Initialize policy params and training state.
   init_policy_params = ppo_losses.PPONetworkParams(
       policy=ppo_network.policy_network.init(key_policy),
@@ -626,38 +643,33 @@ def train(
         training_metrics={})
     logging.info(metrics)
     progress_fn(0, metrics)
-  
-  prefill_key, local_key = jax.random.split(local_key)
-  prefill_keys = jax.random.split(prefill_key, local_devices_to_use)
-  training_state, env_state, buffer_state, _ = prefill_replay_buffer(
-      training_state, env_state, buffer_state, prefill_keys)
-  
-  replay_size = jnp.sum(jax.vmap(
-      replay_buffer.size)(buffer_state)) * jax.process_count()
-  logging.info('replay size after prefill: %s', replay_size)
-  assert replay_size >= min_replay_size
 
-  # train reward model
-  if replay_size >= num_prefs:
-    (training_state, buffer_state), metrics = training_reward_model(
-        training_state, buffer_state)
+  num_prefill_iterations = 4  # Adjust this value as needed
 
-  # buffer_state, samples = jax.vmap(replay_buffer.sample)(buffer_state)
-  # summed_reward = jnp.sum(samples.reward)
-  # logging.info('summed reward: %s', summed_reward)
-  # # logging.info('samples: %s', samples)
-  # # log reward, reward_hat
-  # logging.info('reward: %s', samples.reward)
-  # buffer_state, samples2 = jax.vmap(replay_buffer.sample)(buffer_state)
-  # logging.info('reward: %s', samples2.reward)
-  # buffer_state, samples3 = jax.vmap(replay_buffer.sample)(buffer_state)
-  # logging.info('reward: %s', samples3.reward)
+  logging.info('enter prefill')
+  for i in range(num_prefill_iterations):
+    logging.info('prefill iteration %s', i)
+    prefill_key, local_key = jax.random.split(local_key)
+    prefill_keys = jax.random.split(prefill_key, local_devices_to_use)
+    training_state, env_state, buffer_state, _ = prefill_replay_buffer(
+        training_state, env_state, buffer_state, prefill_keys)
+    
+    replay_size = jnp.sum(jax.vmap(
+        replay_buffer.size)(buffer_state)) * jax.process_count()
+    logging.info('replay size after prefill: %s', replay_size)
+    
+    if replay_size >= segment_size * 5:
+      (training_state, buffer_state), metrics = training_reward_model(
+          training_state, buffer_state)
+      logging.info('Reward model training metrics: %s', metrics)
+    else:
+      logging.info('Skipping reward model training due to insufficient data')
+    
+    pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
+    logging.info(f'Pearson correlation after prefill: {pearson_correlation}')
+  pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
+  logging.info(f'Pearson correlation after prefill: {pearson_correlation}')
 
-  # buffer_state, transitions1 = jax.vmap(replay_buffer.sample)(buffer_state)
-  # buffer_state, transitions2 = jax.vmap(replay_buffer.sample)(buffer_state)
-  # logging.info('transitions 1: %s', transitions1)
-  # logging.info('transitions 2: %s', transitions2)
- 
   training_metrics = {}
   training_walltime = 0
   current_step = 0
@@ -678,8 +690,16 @@ def train(
           in_axes=(0, None))(key_envs, key_envs.shape[1])
       env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
 
-      (training_state, buffer_state), metrics = training_reward_model(
-        training_state, buffer_state)
+      # # Train reward model multiple times
+      # for _ in range(1):  # Adjust the number of iterations as needed
+      #     (training_state, buffer_state), _ = training_reward_model(
+      #         training_state, buffer_state)
+      #     logging.info('Reward model training done')
+
+      pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
+      logging.info(f'Pearson correlation between predicted and true rewards: {pearson_correlation}')
+      training_metrics['pearson_correlation'] = pearson_correlation
+      
 
     if process_id == 0:
       # Run evals.
@@ -701,6 +721,8 @@ def train(
       replay_buffer.size)(buffer_state)) * jax.process_count()
   
   logging.info('replay size at end: %s', replay_size)
+
+  
 
   # If there was no mistakes the training_state should still be identical on all
   # devices.

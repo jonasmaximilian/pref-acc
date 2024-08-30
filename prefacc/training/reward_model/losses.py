@@ -22,12 +22,11 @@ def compute_reward_model_loss(
         _ = carry
         reward_hat_s1 = jnp.sum(pref_pair.segment1.reward)
         reward_hat_s2 = jnp.sum(pref_pair.segment2.reward)
-
         # probability that s1 is preferred over s2 (bradley terry model)
-        prob_s1 = jnp.exp(reward_hat_s1) // jnp.exp(reward_hat_s1) + jnp.exp(reward_hat_s2)
+        prob_s1 = -jnp.log(1 + jnp.exp(reward_hat_s2 - reward_hat_s1))
         # probability that s2 is preferred
-        prob_s2 = jnp.exp(reward_hat_s2) // jnp.exp(reward_hat_s1) + jnp.exp(reward_hat_s2)
-        loss = pref_pair.preference[0] * jnp.log(prob_s1) + pref_pair.preference[1] * jnp.log(prob_s2)
+        prob_s2 = -jnp.log(1 + jnp.exp(reward_hat_s1 - reward_hat_s2))
+        loss = pref_pair.preference[0] * prob_s1 + pref_pair.preference[1] * prob_s2
         # jax.debug.print("🤯 {x} 🤯", x=loss)
 
         return _, loss
