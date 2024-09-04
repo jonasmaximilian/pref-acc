@@ -12,6 +12,7 @@ from brax import base
 from brax import envs
 from brax.training.acting import Evaluator
 from brax.training import gradients
+from prefacc.training import gradients as prefacc_gradients
 from brax.training import pmap
 from brax.training import types as brax_types
 from brax.training.acme import running_statistics
@@ -32,7 +33,8 @@ from prefacc.training import acting
 from prefacc.training import types as prefacc_types
 from prefacc.training.replay_buffers import RandomSamplingQueue
 from prefacc.training.reward_model import losses as rm_losses
-from prefacc.training.reward_model import reward_model as reward_model_networks
+# from prefacc.training.reward_model import reward_model as reward_model_networks
+from prefacc.training.agents.prefppo import reward_model as reward_model_networks
 
 
 InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
@@ -99,7 +101,9 @@ def train(
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
-    reward_model_factory = reward_model_networks.make_reward_model_network,
+    reward_model_factory: brax_types.NetworkFactory[
+    reward_model_networks.RewardModelNetworks
+] = reward_model_networks.make_reward_model_networks,
     progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
     normalize_advantage: bool = True,
     eval_env: Optional[envs.Env] = None,
@@ -164,6 +168,8 @@ def train(
   """
   assert batch_size * num_minibatches % num_envs == 0
   xt = time.time()
+
+  jax.config.update('jax_debug_nans', True)
 
   process_count = jax.process_count()
   process_id = jax.process_index()
@@ -269,6 +275,7 @@ def train(
   reward_model_network = reward_model_factory(
     env_state.obs.shape[-1],
     env.action_size)
+  make_reward_model = reward_model_networks.make_inference_fn(reward_model_network)
 
   policy_optimizer = optax.adam(learning_rate=learning_rate)
   reward_model_optimizer = optax.adam(learning_rate=0.0005)
@@ -308,7 +315,8 @@ def train(
       normalize_advantage=normalize_advantage)
   
   reward_model_loss = functools.partial(
-      rm_losses.compute_reward_model_loss)
+      rm_losses.compute_reward_model_loss,
+      reward_model_network=reward_model_network)
 
   policy_update = gradients.gradient_update_fn(
       policy_loss, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
@@ -356,7 +364,7 @@ def train(
   ) -> Tuple[running_statistics.RunningStatisticsState,
              Union[envs.State, envs_v1.State], ReplayBufferState]:
     policy = make_policy((normalizer_params, policy_params))
-    reward_model = reward_model_networks.make_reward_model(reward_model_params, reward_model_network)
+    reward_model = make_reward_model(reward_model_params)
     env_state, transitions = acting.actor_step(
         env, env_state, policy, reward_model, key, extra_fields=('truncation',))
     
@@ -400,7 +408,7 @@ def train(
 
     policy = make_policy(
         (training_state.normalizer_params, training_state.policy_params.policy))
-    reward_model = reward_model_networks.make_reward_model(training_state.reward_model_params, reward_model_network)
+    reward_model = make_reward_model(training_state.reward_model_params)
 
     def f(carry, unused_t):
       current_state, buffer_state, current_key = carry
@@ -526,23 +534,47 @@ def train(
           summed_reward_s1 = jnp.sum(segment1.true_reward)
           summed_reward_s2 = jnp.sum(segment2.true_reward)
           pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
-          
+          # soft comparison instead of hard one 
+          # (https://jax.readthedocs.io/en/latest/faq.html#why-are-gradients-zero-for-functions-based-on-sort-order)
+          # pref = jax.nn.sigmoid((summed_reward_s1 - summed_reward_s2) * 10)
+          # # jax.debug.print("Preference: {p}", p=pref)
+          # pref = jnp.array([pref, 1 - pref])
+
           # pref_pair = prefacc_types.PreferencePair(segment1, segment2, label)
           pref_pair = prefacc_types.PreferencePair(segment1, segment2, pref)
+
+          
           return (buffer_state), pref_pair
 
       # generate preference pairs
       (buffer_state), pref_data = jax.lax.scan(
           f, (buffer_state), (), length=num_prefs_per_epoch)
       
+      # jax.debug.print("Pref data: {p}", p=pref_data)
+
       # calc and apply loss
+      # jax.debug.print("🔥 {x} 🔥", x=training_state.reward_model_params)
+      # jax.debug.print("Reward model params before update: {p}", p=training_state.reward_model_params)
+      
+      rm_loss, rm_params, rm_optimizer_state = reward_model_update(
+        training_state.reward_model_params,
+        pref_data, 
+        optimizer_state=training_state.reward_model_optimizer_state)
 
-      rm_loss, rm_params, rm_optimizer_state = reward_model_update(training_state.reward_model_params, pref_data, optimizer_state=training_state.reward_model_optimizer_state)
+      # value, grads = jax.value_and_grad(rm_losses.compute_reward_model_loss)(training_state.reward_model_params, pref_data, reward_model)
+      # jax.debug.print("Value: {v}", v=value)
+      # jax.debug.print("Grads: {g}", g=grads)
+      
+      # jax.debug.print("Reward model loss: {l}", l=rm_loss)
+      # jax.debug.print("Reward model params after update: {p}", p=rm_params)
+      # jax.debug.print("😝 {x} 😝", x=rm_params)
 
-      # loss, _ = rm_losses.compute_reward_model_loss(pref_data)
-      # jax.debug.print("😭 {x} 😭", x=loss)
+      # # loss, _ = rm_losses.compute_reward_model_loss(pref_data)
+      jax.debug.print("😭 {x} 😭", x=rm_loss)
 
       logging.info("Done training rm!!!")
+
+      # new_training_state = training_state
 
       new_training_state = training_state.replace(
           reward_model_params=rm_params,
@@ -555,9 +587,6 @@ def train(
   def calculate_pearson_correlation(training_state, buffer_state):
       buffer_state, batch = replay_buffer.sample(buffer_state)
 
-      policy = make_policy((training_state.normalizer_params, training_state.policy_params.policy))
-      reward_model = reward_model_networks.make_reward_model(training_state.reward_model_params, reward_model_network)
-
       correlation = jnp.corrcoef(batch.true_reward, batch.reward)[0, 1]
       return correlation
   
@@ -569,7 +598,7 @@ def train(
       value=ppo_network.value_network.init(key_value),
   )
 
-  init_reward_model_params = reward_model_network.init(key_reward_model)
+  init_reward_model_params = reward_model_network.reward_model_network.init(key_reward_model)
 
   training_state = TrainingState(  # pytype: disable=wrong-arg-brax_types  # jax-ndarray
       policy_optimizer_state=policy_optimizer.init(init_policy_params),  # pytype: disable=wrong-arg-brax_types  # numpy-scalars
@@ -659,16 +688,18 @@ def train(
     logging.info('replay size after prefill: %s', replay_size)
     
     if replay_size >= segment_size * 5:
+      # logging.info('Params before training %s', training_state.reward_model_params)
       (training_state, buffer_state), metrics = training_reward_model(
           training_state, buffer_state)
+      # logging.info('Params after training %s', training_state.reward_model_params)
       logging.info('Reward model training metrics: %s', metrics)
     else:
       logging.info('Skipping reward model training due to insufficient data')
     
-    pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
-    logging.info(f'Pearson correlation after prefill: {pearson_correlation}')
-  pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
-  logging.info(f'Pearson correlation after prefill: {pearson_correlation}')
+    # pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
+  #   logging.info(f'Pearson correlation after prefill: {pearson_correlation}')
+  # pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
+  # logging.info(f'Pearson correlation after prefill: {pearson_correlation}')
 
   training_metrics = {}
   training_walltime = 0
@@ -690,15 +721,17 @@ def train(
           in_axes=(0, None))(key_envs, key_envs.shape[1])
       env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
 
-      # # Train reward model multiple times
-      # for _ in range(1):  # Adjust the number of iterations as needed
-      #     (training_state, buffer_state), _ = training_reward_model(
-      #         training_state, buffer_state)
-      #     logging.info('Reward model training done')
+      # Train reward model multiple times
+      for _ in range(3):  # Adjust the number of iterations as needed
+          # logging.info('Params before training %s', training_state.reward_model_params)
+          (training_state, buffer_state), _ = training_reward_model(
+              training_state, buffer_state)
+          # logging.info('Params after training %s', training_state.reward_model_params)
+          logging.info('Reward model training done')
 
-      pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
-      logging.info(f'Pearson correlation between predicted and true rewards: {pearson_correlation}')
-      training_metrics['pearson_correlation'] = pearson_correlation
+      # pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
+      # logging.info(f'Pearson correlation between predicted and true rewards: {pearson_correlation}')
+      # training_metrics['pearson_correlation'] = pearson_correlation
       
 
     if process_id == 0:
