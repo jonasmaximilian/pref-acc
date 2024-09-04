@@ -27,7 +27,7 @@ def actor_step(
   nstate = env.step(env_state, actions)
   state_extras = {x: nstate.info[x] for x in extra_fields}
   reward = reward_model(nstate.obs, actions)
-#   reward = jax.nn.tanh(reward)
+  # reward = jax.nn.tanh(reward)
   return nstate, Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
       observation=env_state.obs,
       action=actions,

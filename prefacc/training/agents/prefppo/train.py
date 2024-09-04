@@ -673,7 +673,7 @@ def train(
     logging.info(metrics)
     progress_fn(0, metrics)
 
-  num_prefill_iterations = 4  # Adjust this value as needed
+  num_prefill_iterations = 10  # Adjust this value as needed
 
   logging.info('enter prefill')
   for i in range(num_prefill_iterations):
@@ -689,9 +689,10 @@ def train(
     
     if replay_size >= segment_size * 5:
       # logging.info('Params before training %s', training_state.reward_model_params)
-      (training_state, buffer_state), metrics = training_reward_model(
-          training_state, buffer_state)
-      # logging.info('Params after training %s', training_state.reward_model_params)
+      for _ in range(3):
+        (training_state, buffer_state), metrics = training_reward_model(
+            training_state, buffer_state)
+      logging.info('Params after training %s', training_state.reward_model_params)
       logging.info('Reward model training metrics: %s', metrics)
     else:
       logging.info('Skipping reward model training due to insufficient data')
@@ -726,7 +727,7 @@ def train(
           # logging.info('Params before training %s', training_state.reward_model_params)
           (training_state, buffer_state), _ = training_reward_model(
               training_state, buffer_state)
-          # logging.info('Params after training %s', training_state.reward_model_params)
+          logging.info('Params after training %s', training_state.reward_model_params)
           logging.info('Reward model training done')
 
       # pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)

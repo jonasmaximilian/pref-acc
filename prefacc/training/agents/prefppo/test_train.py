@@ -143,19 +143,18 @@ class PrefPPOTest(parameterized.TestCase):
   #   # self.assertEqual(fast.reset_count, 2)  # type: ignore
   #   # self.assertEqual(fast.step_count, 3)  # type: ignore
 
-  # def testTrainAnt(self): 
+  # def testTrainAnt(self):
   #   env = envs.get_environment('ant', backend='positional')
   #   _, _, metrics = prefppo.train(
   #       env,
   #       num_timesteps=4_000_000, num_evals=5, reward_scaling=10, episode_length=1000, normalize_observations=True, action_repeat=1, unroll_length=5, num_minibatches=32, num_updates_per_batch=4, discounting=0.97, learning_rate=3e-4, entropy_cost=1e-2, num_envs=4096, batch_size=2048, seed=1
   #   )
-  
-  def testTrainAnt2(self): 
+
+  def testTrainAnt(self):
     env = envs.get_environment('ant', backend='positional')
     _, _, metrics = prefppo.train(
-      env,
-      num_timesteps=50_000_000, num_evals=10, reward_scaling=10, episode_length=1000, normalize_observations=True, action_repeat=1, unroll_length=5, num_minibatches=32, num_updates_per_batch=4, discounting=0.97, learning_rate=3e-4, entropy_cost=1e-2, num_envs=4096, batch_size=2048, seed=1
-  )
+        env,
+num_timesteps=50_000_000, num_evals=10, reward_scaling=10, episode_length=1000, normalize_observations=True, action_repeat=1, unroll_length=5, num_minibatches=32, num_updates_per_batch=4, discounting=0.97, learning_rate=3e-4, entropy_cost=1e-2, num_envs=4096, batch_size=2048, seed=1    )
   
   # def testTrainWalker2d(self):
   #   env = envs.get_environment('walker2d', backend='positional')
