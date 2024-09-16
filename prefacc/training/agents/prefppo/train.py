@@ -7,6 +7,8 @@ import functools
 import time
 from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
+import matplotlib.pyplot as plt
+
 from absl import logging
 from brax import base
 from brax import envs
@@ -33,7 +35,6 @@ from prefacc.training import acting
 from prefacc.training import types as prefacc_types
 from prefacc.training.replay_buffers import RandomSamplingQueue
 from prefacc.training.reward_model import losses as rm_losses
-# from prefacc.training.reward_model import reward_model as reward_model_networks
 from prefacc.training.agents.prefppo import reward_model as reward_model_networks
 
 
@@ -98,6 +99,8 @@ def train(
     deterministic_eval: bool = False,
     segment_size: int = 50,
     num_prefs: int = 2000, # This is for testing atm, should be then used to calc num_prefs_per_training_step
+    num_prefill_iterations: int = 4,
+    num_rm_updates_per_epoch: int = 3,
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
@@ -151,6 +154,11 @@ def train(
     clipping_epsilon: clipping epsilon for PPO loss
     gae_lambda: General advantage estimation lambda
     deterministic_eval: whether to run the eval with a deterministic policy
+    segment_size: the size of the trajectories used to calculate the loss for
+      the rm
+    num_prefs: number of preferences to be elicted during the whole training
+    num_prefill_iterations: how often to pretrain the reward model
+    num_rm_updated_per_epoch: hopw often to update the rm during an epoch
     network_factory: function that generates networks for policy and value
       functions
     reward_model_factory: function that generates the reward model network
@@ -169,7 +177,7 @@ def train(
   assert batch_size * num_minibatches % num_envs == 0
   xt = time.time()
 
-  jax.config.update('jax_debug_nans', True)
+  # jax.config.update('jax_debug_nans', True)
 
   process_count = jax.process_count()
   process_id = jax.process_index()
@@ -185,17 +193,13 @@ def train(
 
   # Calculate min_replay_size as a fraction of num_timesteps
   min_replay_size = max(int(0.05 * num_timesteps), batch_size * unroll_length)
-  
-  # Ensure min_replay_size is at least batch_size * unroll_length
-  min_replay_size = max(min_replay_size, batch_size * unroll_length)
+  min_replay_size = min(min_replay_size, num_timesteps)
+
   logging.info(f'Minimum replay size: {min_replay_size}')
 
-  if min_replay_size >= num_timesteps:
+  if min_replay_size > num_timesteps:
     raise ValueError(
         'No training will happen because min_replay_size >= num_timesteps')
-  
-  # if max_replay_size is None:
-  #   max_replay_size = num_timesteps
 
   num_prefill_actor_steps = -(-min_replay_size // num_envs)
   logging.info(f'Number of prefill actor steps: {num_prefill_actor_steps}')
@@ -518,6 +522,7 @@ def train(
       training_state: TrainingState, buffer_state: ReplayBufferState
   ) -> Tuple[TrainingState, ReplayBufferState, Metrics]:
       
+      
       def f(carry, unused):
           buffer_state = carry
           buffer_state, segment1 = replay_buffer.sample(buffer_state)
@@ -534,13 +539,6 @@ def train(
           summed_reward_s1 = jnp.sum(segment1.true_reward)
           summed_reward_s2 = jnp.sum(segment2.true_reward)
           pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
-          # soft comparison instead of hard one 
-          # (https://jax.readthedocs.io/en/latest/faq.html#why-are-gradients-zero-for-functions-based-on-sort-order)
-          # pref = jax.nn.sigmoid((summed_reward_s1 - summed_reward_s2) * 10)
-          # # jax.debug.print("Preference: {p}", p=pref)
-          # pref = jnp.array([pref, 1 - pref])
-
-          # pref_pair = prefacc_types.PreferencePair(segment1, segment2, label)
           pref_pair = prefacc_types.PreferencePair(segment1, segment2, pref)
 
           
@@ -549,32 +547,27 @@ def train(
       # generate preference pairs
       (buffer_state), pref_data = jax.lax.scan(
           f, (buffer_state), (), length=num_prefs_per_epoch)
+    
+      def g(carry, pref_pair):
+          _ = carry
+          pearson_correlation = jnp.corrcoef(pref_pair.segment1.true_reward, pref_pair.segment1.reward)[0, 1]
+          return (), pearson_correlation
       
-      # jax.debug.print("Pref data: {p}", p=pref_data)
-
-      # calc and apply loss
-      # jax.debug.print("🔥 {x} 🔥", x=training_state.reward_model_params)
-      # jax.debug.print("Reward model params before update: {p}", p=training_state.reward_model_params)
+      (_), pearson_correlation = jax.lax.scan(g, (), pref_data)
+      
+      # Add Pearson correlation to metrics
+      metrics = {
+          'reward_model/pearson_correlation': jnp.mean(pearson_correlation),
+      }
       
       rm_loss, rm_params, rm_optimizer_state = reward_model_update(
         training_state.reward_model_params,
         pref_data, 
         optimizer_state=training_state.reward_model_optimizer_state)
-
-      # value, grads = jax.value_and_grad(rm_losses.compute_reward_model_loss)(training_state.reward_model_params, pref_data, reward_model)
-      # jax.debug.print("Value: {v}", v=value)
-      # jax.debug.print("Grads: {g}", g=grads)
       
-      # jax.debug.print("Reward model loss: {l}", l=rm_loss)
-      # jax.debug.print("Reward model params after update: {p}", p=rm_params)
-      # jax.debug.print("😝 {x} 😝", x=rm_params)
-
-      # # loss, _ = rm_losses.compute_reward_model_loss(pref_data)
-      jax.debug.print("😭 {x} 😭", x=rm_loss)
-
+      metrics['reward_model/loss'] = rm_loss
+      
       logging.info("Done training rm!!!")
-
-      # new_training_state = training_state
 
       new_training_state = training_state.replace(
           reward_model_params=rm_params,
@@ -583,14 +576,6 @@ def train(
       return (new_training_state, buffer_state), metrics
   
   training_reward_model = jax.pmap(training_reward_model,axis_name=_PMAP_AXIS_NAME)
-
-  def calculate_pearson_correlation(training_state, buffer_state):
-      buffer_state, batch = replay_buffer.sample(buffer_state)
-
-      correlation = jnp.corrcoef(batch.true_reward, batch.reward)[0, 1]
-      return correlation
-  
-  calculate_pearson_correlation = jax.pmap(calculate_pearson_correlation, axis_name=_PMAP_AXIS_NAME)
   
   # Initialize policy params and training state.
   init_policy_params = ppo_losses.PPONetworkParams(
@@ -673,9 +658,8 @@ def train(
     logging.info(metrics)
     progress_fn(0, metrics)
 
-  num_prefill_iterations = 10  # Adjust this value as needed
-
   logging.info('enter prefill')
+
   for i in range(num_prefill_iterations):
     logging.info('prefill iteration %s', i)
     prefill_key, local_key = jax.random.split(local_key)
@@ -688,19 +672,16 @@ def train(
     logging.info('replay size after prefill: %s', replay_size)
     
     if replay_size >= segment_size * 5:
-      # logging.info('Params before training %s', training_state.reward_model_params)
-      for _ in range(3):
+      for _ in range(num_rm_updates_per_epoch):
         (training_state, buffer_state), metrics = training_reward_model(
             training_state, buffer_state)
-      logging.info('Params after training %s', training_state.reward_model_params)
       logging.info('Reward model training metrics: %s', metrics)
     else:
       logging.info('Skipping reward model training due to insufficient data')
-    
-    # pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
-  #   logging.info(f'Pearson correlation after prefill: {pearson_correlation}')
-  # pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
-  # logging.info(f'Pearson correlation after prefill: {pearson_correlation}')
+
+  eval_rewards = list()
+  rm_corr = list()
+  rm_loss = list()
 
   training_metrics = {}
   training_walltime = 0
@@ -723,17 +704,14 @@ def train(
       env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
 
       # Train reward model multiple times
-      for _ in range(3):  # Adjust the number of iterations as needed
-          # logging.info('Params before training %s', training_state.reward_model_params)
-          (training_state, buffer_state), _ = training_reward_model(
+      for _ in range(num_rm_updates_per_epoch):
+          (training_state, buffer_state), rm_metrics = training_reward_model(
               training_state, buffer_state)
-          logging.info('Params after training %s', training_state.reward_model_params)
+          # Track the rm_metrics
+          rm_corr.append(rm_metrics['reward_model/pearson_correlation'])
+          rm_loss.append(rm_metrics['reward_model/loss'])
+          logging.info('rm_metrics: %s', rm_metrics)
           logging.info('Reward model training done')
-
-      # pearson_correlation = calculate_pearson_correlation(training_state, buffer_state)
-      # logging.info(f'Pearson correlation between predicted and true rewards: {pearson_correlation}')
-      # training_metrics['pearson_correlation'] = pearson_correlation
-      
 
     if process_id == 0:
       # Run evals.
@@ -748,6 +726,8 @@ def train(
       )
       policy_params_fn(current_step, make_policy, policy_params)
 
+      eval_rewards.append(metrics['eval/episode_reward'])
+
   total_steps = current_step
   assert total_steps >= num_timesteps
 
@@ -756,7 +736,37 @@ def train(
   
   logging.info('replay size at end: %s', replay_size)
 
-  
+  # After the training loop
+  if process_id == 0:
+    plt.figure(figsize=(10, 6))
+    plt.plot(eval_rewards)
+    plt.title('Evaluation Reward over Training')
+    plt.xlabel('Evaluation Number')
+    plt.ylabel('Average Episode Reward')
+    plt.savefig('eval_reward_plot.png')
+    plt.close()
+
+    logging.info(f'Evaluation rewards: {eval_rewards}')
+
+  plt.figure(figsize=(10, 6))
+  plt.plot(rm_corr)
+  plt.title('Pearson Correlation over Reward Model Training')
+  plt.xlabel('Training Iteration')
+  plt.ylabel('Pearson Correlation')
+  plt.savefig('pearson_corr_plot.png')
+  plt.close()
+
+  logging.info(f'Pearson correlation over training: {rm_corr}')
+
+  plt.figure(figsize=(10, 6))
+  plt.plot(rm_loss)
+  plt.title('Reward Model Loss over Training')
+  plt.xlabel('Training Iteration')
+  plt.ylabel('Reward Model Loss')
+  plt.savefig('reward_model_loss_plot.png')
+  plt.close()
+
+  logging.info(f'Reward model loss over training: {rm_loss}')
 
   # If there was no mistakes the training_state should still be identical on all
   # devices.
