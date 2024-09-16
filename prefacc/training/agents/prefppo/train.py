@@ -14,7 +14,6 @@ from brax import base
 from brax import envs
 from brax.training.acting import Evaluator
 from brax.training import gradients
-from prefacc.training import gradients as prefacc_gradients
 from brax.training import pmap
 from brax.training import types as brax_types
 from brax.training.acme import running_statistics
