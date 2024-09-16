@@ -15,7 +15,7 @@ ActivationFn = Callable[[jnp.ndarray], jnp.ndarray]
 def make_reward_model_network(
     obs_size: int,
     action_size: int,
-    hidden_layer_sizes: Sequence[int] = (256,) * 3,
+    hidden_layer_sizes: Sequence[int] = (256,) * 2,
     activation: ActivationFn = linen.relu
 ) -> FeedForwardNetwork:
   reward_model_module = MLP(
