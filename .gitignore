@@ -61,3 +61,6 @@ sysinfo.txt
 *.unitypackage
 
 UnitySDK.log
+
+# plots
+*.png

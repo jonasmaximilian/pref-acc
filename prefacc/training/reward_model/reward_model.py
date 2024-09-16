@@ -15,7 +15,7 @@ ActivationFn = Callable[[jnp.ndarray], jnp.ndarray]
 def make_reward_model_network(
     obs_size: int,
     action_size: int,
-    hidden_layer_sizes: Sequence[int] = (256, 256),
+    hidden_layer_sizes: Sequence[int] = (256,) * 2,
     activation: ActivationFn = linen.relu
 ) -> FeedForwardNetwork:
   reward_model_module = MLP(
@@ -25,15 +25,10 @@ def make_reward_model_network(
   
   def apply(reward_model_params, obs, action):
     inputs = jnp.concatenate([obs, action], axis=-1)
-    return jnp.squeeze(reward_model_module.apply(reward_model_params, inputs), axis=-1)
+    return jnp.squeeze(reward_model_module.apply(reward_model_params, inputs), axis=-1).astype(jnp.float32)
   
   dummy_obs = jnp.zeros((1, obs_size))
   dummy_action = jnp.zeros((1, action_size))
   dummy_input = jnp.concatenate([dummy_obs, dummy_action], axis=-1)
   return FeedForwardNetwork(
     init=lambda key: reward_model_module.init(key, dummy_input), apply=apply)
-
-def make_reward_model(params, reward_model_network) -> Callable[[types.Observation, types.Action], float]:
-  def reward_model(observations: types.Observation, actions: types.Action) -> float:
-    return reward_model_network.apply(params, observations, actions)
-  return reward_model

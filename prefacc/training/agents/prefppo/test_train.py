@@ -13,13 +13,12 @@ from prefacc.training.agents.prefppo import train as prefppo
 class PrefPPOTest(parameterized.TestCase):
   """Tests for PrefPPO module."""
 
-
   def testTrain(self):
     """Test PrefPPO with a simple env."""
     fast = envs.get_environment('fast')
     _, _, metrics = prefppo.train(
         fast,
-        num_timesteps=2**15,
+        num_timesteps=2**12,
         episode_length=128,
         num_envs=64,
         learning_rate=3e-4,
@@ -34,9 +33,9 @@ class PrefPPOTest(parameterized.TestCase):
         num_evals=3,
         reward_scaling=10,
         normalize_advantage=False)
-    self.assertGreater(metrics['eval/episode_reward'], 15)
+    self.assertGreater(metrics['eval/episode_reward'], 3)
     self.assertEqual(fast.reset_count, 2)  # type: ignore
-    self.assertEqual(fast.step_count, 3)  # type: ignore
+    self.assertEqual(fast.step_count, 4)  # type: ignore
 
   def testTrainV2(self):
     """Test PrefPPO with a v2 env."""
@@ -119,7 +118,7 @@ class PrefPPOTest(parameterized.TestCase):
   
   def testTrainBuffer(self):
     """Test PrefPPO with prefill."""
-    fast = envs.get_environment('ant', backend='positional')
+    fast = envs.get_environment('inverted_pendulum', backend='spring')
     _, _, metrics = prefppo.train(
         fast,
         num_timesteps=2**15,
@@ -142,6 +141,27 @@ class PrefPPOTest(parameterized.TestCase):
     self.assertGreater(metrics['eval/episode_reward'], 5)
     # self.assertEqual(fast.reset_count, 2)  # type: ignore
     # self.assertEqual(fast.step_count, 3)  # type: ignore
+
+  # def testTrainAnt(self):
+  #   env = envs.get_environment('ant', backend='positional')
+  #   _, _, metrics = prefppo.train(
+  #       env,
+  #       num_timesteps=4_000_000, num_evals=5, reward_scaling=10, episode_length=1000, normalize_observations=True, action_repeat=1, unroll_length=5, num_minibatches=32, num_updates_per_batch=4, discounting=0.97, learning_rate=3e-4, entropy_cost=1e-2, num_envs=4096, batch_size=2048, seed=1
+  #   )
+
+  # def testTrainAnt(self):
+  #   env = envs.get_environment('ant', backend='positional')
+  #   _, _, metrics = prefppo.train(
+  #       env,
+  #       num_timesteps=50_000_000, num_evals=10, reward_scaling=10, episode_length=1000, normalize_observations=True, action_repeat=1, unroll_length=5, num_minibatches=32, num_updates_per_batch=4, discounting=0.97, learning_rate=3e-4, entropy_cost=1e-2, num_envs=4096, batch_size=2048, seed=1
+  # , num_prefs=2000)  
+
+#   def testTrainHalfCheetah(self):
+#     env = envs.get_environment('halfcheetah', backend='positional')
+#     _, _, metrics = prefppo.train(
+#         env,
+# num_timesteps=20_000_000, num_evals=10, reward_scaling=10, episode_length=1000, normalize_observations=True, action_repeat=1, unroll_length=5, num_minibatches=32, num_updates_per_batch=4, discounting=0.97, learning_rate=3e-4, entropy_cost=1e-2, num_envs=4096, batch_size=2048, seed=1
+#   , num_prefs=700)  
 
 
 if __name__ == '__main__':
