@@ -51,8 +51,8 @@ class TrainingState:
   """Contains training state for the learner."""
   policy_optimizer_state: optax.OptState
   policy_params: ppo_losses.PPONetworkParams
-  reward_model_optimizer_state: optax.OptState
-  reward_model_params: brax_types.Params
+  reward_model_optimizer_states: Sequence[optax.OptState]
+  reward_model_params: Sequence[Params]
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: jnp.ndarray
 
@@ -79,6 +79,7 @@ def train(
     max_devices_per_host: Optional[int] = None,
     num_eval_envs: int = 128,
     learning_rate: float = 1e-4,
+    rm_learning_rate: float = 0.0005,
     entropy_cost: float = 1e-4,
     discounting: float = 0.9,
     seed: int = 0,
@@ -96,10 +97,11 @@ def train(
     max_replay_size: Optional[int] = None,
     grad_updates_per_step: int = 1,
     deterministic_eval: bool = False,
-    segment_size: int = 50,
+    segment_size: int = 32,
     num_prefs: int = 2000, # This is for testing atm, should be then used to calc num_prefs_per_training_step
-    num_prefill_iterations: int = 4,
+    num_prefill_iterations: int = 10,
     num_rm_updates_per_epoch: int = 3,
+    rm_ensamble_size: int = 1,
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
@@ -192,7 +194,7 @@ def train(
 
   # Calculate min_replay_size as a fraction of num_timesteps
   min_replay_size = max(int(0.05 * num_timesteps), batch_size * unroll_length)
-  min_replay_size = min(min_replay_size, num_timesteps)
+  min_replay_size = min(min_replay_size, num_timesteps) #TODO was sollte das sein? Wie viele steps werden in training_epoch gemacht env_step_per_training_step?
 
   logging.info(f'Minimum replay size: {min_replay_size}')
 
@@ -281,7 +283,7 @@ def train(
   make_reward_model = reward_model_networks.make_inference_fn(reward_model_network)
 
   policy_optimizer = optax.adam(learning_rate=learning_rate)
-  reward_model_optimizer = optax.adam(learning_rate=0.0005)
+  reward_model_optimizer = optax.adam(learning_rate=rm_learning_rate)
 
   dummy_obs = jnp.zeros((obs_size,))
   dummy_action = jnp.zeros((action_size,))
@@ -367,9 +369,10 @@ def train(
   ) -> Tuple[running_statistics.RunningStatisticsState,
              Union[envs.State, envs_v1.State], ReplayBufferState]:
     policy = make_policy((normalizer_params, policy_params))
-    reward_model = make_reward_model(reward_model_params)
+
+    reward_models = [make_reward_model(params) for params in reward_model_params]
     env_state, transitions = acting.actor_step(
-        env, env_state, policy, reward_model, key, extra_fields=('truncation',))
+        env, env_state, policy, reward_models, key, extra_fields=('truncation',))
     
     normalizer_params = running_statistics.update(
         normalizer_params,
@@ -382,7 +385,7 @@ def train(
   def unroll_and_insert(env: Union[envs.Env, envs_v1.Env, envs_v1.Wrapper],
                         env_state: State,
                         policy: brax_types.Policy,
-                        reward_model,
+                        reward_models,
                         buffer_state: ReplayBufferState,
                         key: PRNGKey,
                         unroll_length: int,
@@ -394,7 +397,7 @@ def train(
       state, buffer_state, current_key = carry
       current_key, next_key = jax.random.split(current_key)
       nstate, transition = acting.actor_step(
-          env, state, policy, reward_model, current_key, extra_fields=extra_fields)
+          env, state, policy, reward_models, current_key, extra_fields=extra_fields)
       buffer_state = replay_buffer.insert(buffer_state, transition)
       return (nstate, buffer_state, next_key), transition
 
@@ -411,7 +414,8 @@ def train(
 
     policy = make_policy(
         (training_state.normalizer_params, training_state.policy_params.policy))
-    reward_model = make_reward_model(training_state.reward_model_params)
+    #TODO: same as in get_experience
+    reward_models = [make_reward_model(params) for params in reward_model_params]
 
     def f(carry, unused_t):
       current_state, buffer_state, current_key = carry
@@ -420,7 +424,7 @@ def train(
           env,
           current_state,
           policy,
-          reward_model,
+          reward_models,
           buffer_state,
           current_key,
           unroll_length,
@@ -452,7 +456,7 @@ def train(
     new_training_state = TrainingState(
         policy_optimizer_state=policy_optimizer_state,
         policy_params=policy_params,
-        reward_model_optimizer_state=training_state.reward_model_optimizer_state,
+        reward_model_optimizer_states=training_state.reward_model_optimizer_states,
         reward_model_params=training_state.reward_model_params,
         normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step)
@@ -527,7 +531,6 @@ def train(
           buffer_state, segment1 = replay_buffer.sample(buffer_state)
           buffer_state, segment2 = replay_buffer.sample(buffer_state)
 
-          # idk if this works if grad_updates_per_step != 1
           segment1 = jax.tree_util.tree_map(
               lambda x: jnp.reshape(x, (grad_updates_per_step, -1) + x.shape[1:]),
               segment1)
@@ -546,6 +549,8 @@ def train(
       # generate preference pairs
       (buffer_state), pref_data = jax.lax.scan(
           f, (buffer_state), (), length=num_prefs_per_epoch)
+
+      #TODO: Loop over preference pairs and then create tuples (pref_pair, uncertainty). then sort after leading uncertainty and choose the top n pairs
     
       def g(carry, pref_pair):
           _ = carry
@@ -559,18 +564,48 @@ def train(
           'reward_model/pearson_correlation': jnp.mean(pearson_correlation),
       }
       
-      rm_loss, rm_params, rm_optimizer_state = reward_model_update(
-        training_state.reward_model_params,
-        pref_data, 
-        optimizer_state=training_state.reward_model_optimizer_state)
+      # # Assuming training_state.reward_model_params and training_state.reward_model_optimizer_state are jnp.ndarrays
+      # rm_loss, rm_params, rm_optimizer_state = jax.vmap(
+      #     reward_model_update,
+      #     in_axes=(0, 0, None)  # Iterate over params and optimizer states
+      # )(training_state.reward_model_params,
+      #   pref_data, 
+      #   optimizer_state=training_state.reward_model_optimizer_state)
+
+      def update_single_model(params, optimizer_state, pref_data):
+          rm_loss, rm_params, rm_optimizer_state = reward_model_update(
+          params,
+          pref_data, 
+          optimizer_state=optimizer_state)
+          # jax.debug.print("before {params}", params=params)
+          # jax.debug.print("after {rm_params}", rm_params=rm_params)
+          return rm_params, rm_optimizer_state, rm_loss
+
       
-      metrics['reward_model/loss'] = rm_loss
+      new_params = []
+      new_optimizer_states = []
+      losses = []
+      
+      for params, optimizer_state in zip(training_state.reward_model_params, training_state.reward_model_optimizer_states):
+          rm_params, rm_optimizer_state, rm_loss = update_single_model(params, optimizer_state, pref_data)
+          new_params.append(rm_params)
+          new_optimizer_states.append(rm_optimizer_state)
+          losses.append(rm_loss)
+      
+      # jax.debug.print("new params: {x}", x=new_params)
+      
+      # rm_loss, rm_params, rm_optimizer_state = reward_model_update(
+      #   training_state.reward_model_params,
+      #   pref_data, 
+      #   optimizer_state=training_state.reward_model_optimizer_state)
+      
+      metrics['reward_model/loss'] = jnp.mean(jnp.stack(losses))
       
       logging.info("Done training rm!!!")
 
       new_training_state = training_state.replace(
-          reward_model_params=rm_params,
-          reward_model_optimizer_state=rm_optimizer_state)
+          reward_model_params=new_params,
+          reward_model_optimizer_states=new_optimizer_states)
 
       return (new_training_state, buffer_state), metrics
   
@@ -582,13 +617,16 @@ def train(
       value=ppo_network.value_network.init(key_value),
   )
 
-  init_reward_model_params = reward_model_network.reward_model_network.init(key_reward_model)
+  reward_model_keys = jax.random.split(key_reward_model, rm_ensamble_size)
+  reward_model_params = [reward_model_network.reward_model_network.init(key) for key in reward_model_keys]
 
+  reward_model_optimizers = [reward_model_optimizer.init(params) for params in reward_model_params]
+    
   training_state = TrainingState(  # pytype: disable=wrong-arg-brax_types  # jax-ndarray
       policy_optimizer_state=policy_optimizer.init(init_policy_params),  # pytype: disable=wrong-arg-brax_types  # numpy-scalars
       policy_params=init_policy_params,
-      reward_model_optimizer_state=reward_model_optimizer.init(init_reward_model_params),
-      reward_model_params=init_reward_model_params,
+      reward_model_optimizer_states=reward_model_optimizers,
+      reward_model_params=reward_model_params,
       normalizer_params=running_statistics.init_state(
           specs.Array(env_state.obs.shape[-1:], jnp.dtype('float32'))),
       env_steps=0)
@@ -703,6 +741,7 @@ def train(
       env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
 
       # Train reward model multiple times
+      # TODO make it so it just updates multiple batches instead of full function calls (already implenmented earlier)
       for _ in range(num_rm_updates_per_epoch):
           (training_state, buffer_state), rm_metrics = training_reward_model(
               training_state, buffer_state)
@@ -774,4 +813,4 @@ def train(
       (training_state.normalizer_params, training_state.policy_params.policy))
   logging.info('total steps: %s', total_steps)
   pmap.synchronize_hosts()
-  return (make_policy, policy_params, metrics)
+  return (make_policy, 0, {})

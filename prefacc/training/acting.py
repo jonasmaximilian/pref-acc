@@ -7,6 +7,7 @@ from brax.training.types import Policy
 from brax.training.types import PRNGKey
 from brax.v1 import envs as envs_v1
 import jax
+import jax.numpy as jnp
 import numpy as np
 from prefacc.training.types import Transition
 
@@ -18,7 +19,7 @@ def actor_step(
     env: Env,
     env_state: State,
     policy: Policy,
-    reward_model,
+    reward_models,
     key: PRNGKey,
     extra_fields: Sequence[str] = ()
 ) -> Tuple[State, Transition]:
@@ -26,7 +27,10 @@ def actor_step(
   actions, policy_extras = policy(env_state.obs, key)
   nstate = env.step(env_state, actions)
   state_extras = {x: nstate.info[x] for x in extra_fields}
-  reward = reward_model(nstate.obs, actions)
+  
+  ensamble_rewards = [rm(env_state.obs, actions) for rm in reward_models]
+  reward = jnp.mean(jnp.stack(ensamble_rewards), axis=0)
+  jax.debug.print("reward {x}", x=reward)
   # reward = jax.nn.tanh(reward)
   return nstate, Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
       observation=env_state.obs,
