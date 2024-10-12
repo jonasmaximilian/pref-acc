@@ -96,10 +96,11 @@ def train(
     max_replay_size: Optional[int] = None,
     grad_updates_per_step: int = 1,
     deterministic_eval: bool = False,
+    rm_learning_rate: float = 0.0003,
     segment_size: int = 50,
-    num_prefs: int = 2000, # This is for testing atm, should be then used to calc num_prefs_per_training_step
+    num_prefs: int = 2000,
     num_prefill_iterations: int = 10,
-    num_rm_updates_per_epoch: int = 1, # change this to num_rm_iterations
+    num_rm_batches: int = 10,
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
@@ -280,7 +281,7 @@ def train(
   make_reward_model = reward_model_networks.make_inference_fn(reward_model_network)
 
   policy_optimizer = optax.adam(learning_rate=learning_rate)
-  reward_model_optimizer = optax.adam(learning_rate=0.0003)
+  reward_model_optimizer = optax.adam(learning_rate=rm_learning_rate)
 
   dummy_obs = jnp.zeros((obs_size,))
   dummy_action = jnp.zeros((action_size,))
@@ -552,7 +553,7 @@ def train(
         rm_params, pref_data, optimizer_state=rm_optimizer_state)
         return (rm_params, rm_optimizer_state), rm_loss
       
-      num_rm_iterations = 10  # Adjust this value as needed
+      num_rm_iterations = num_rm_batches
       (rm_params, rm_optimizer_state), rm_losses = jax.lax.scan(
         train_rm_iter, 
         (training_state.reward_model_params, training_state.reward_model_optimizer_state),
@@ -683,9 +684,8 @@ def train(
     logging.info('replay size after prefill: %s', replay_size)
     
     if replay_size >= segment_size * 5:
-      for _ in range(num_rm_updates_per_epoch):
-        (training_state, buffer_state), metrics = training_reward_model(
-            training_state, buffer_state)
+      (training_state, buffer_state), metrics = training_reward_model(
+          training_state, buffer_state)
       logging.info('Reward model training metrics: %s', metrics)
     else:
       logging.info('Skipping reward model training due to insufficient data')
@@ -719,14 +719,14 @@ def train(
       env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
 
       # Train reward model multiple times
-      for _ in range(num_rm_updates_per_epoch):
-          (training_state, buffer_state), rm_metrics = training_reward_model(
-              training_state, buffer_state)
-          # Track the rm_metrics
-          rm_corr.append(rm_metrics['reward_model/pearson_correlation'])
-          rm_loss.append(rm_metrics['reward_model/loss'])
-          logging.info('rm_metrics: %s', rm_metrics)
-          logging.info('Reward model training done')
+
+      (training_state, buffer_state), rm_metrics = training_reward_model(
+          training_state, buffer_state)
+      # Track the rm_metrics
+      rm_corr.append(rm_metrics['reward_model/pearson_correlation'])
+      rm_loss.append(rm_metrics['reward_model/loss'])
+      logging.info('rm_metrics: %s', rm_metrics)
+      logging.info('Reward model training done')
 
     if process_id == 0:
       # Run evals.
