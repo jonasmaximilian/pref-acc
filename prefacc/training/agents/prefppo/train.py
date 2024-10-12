@@ -98,8 +98,8 @@ def train(
     deterministic_eval: bool = False,
     segment_size: int = 50,
     num_prefs: int = 2000, # This is for testing atm, should be then used to calc num_prefs_per_training_step
-    num_prefill_iterations: int = 4,
-    num_rm_updates_per_epoch: int = 3,
+    num_prefill_iterations: int = 10,
+    num_rm_updates_per_epoch: int = 1, # change this to num_rm_iterations
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
@@ -190,21 +190,6 @@ def train(
       process_id, local_device_count, local_devices_to_use)
   device_count = local_devices_to_use * process_count
 
-  # Calculate min_replay_size as a fraction of num_timesteps
-  min_replay_size = max(int(0.05 * num_timesteps), batch_size * unroll_length)
-  min_replay_size = min(min_replay_size, num_timesteps)
-
-  logging.info(f'Minimum replay size: {min_replay_size}')
-
-  if min_replay_size > num_timesteps:
-    raise ValueError(
-        'No training will happen because min_replay_size >= num_timesteps')
-
-  num_prefill_actor_steps = -(-min_replay_size // num_envs)
-  logging.info(f'Number of prefill actor steps: {num_prefill_actor_steps}')
-  num_prefs_per_epoch = num_prefs // num_evals 
-  logging.info(f'Number of prefs per epoch: {num_prefs_per_epoch}')
-
   # The number of environment steps executed for every training step.
   env_step_per_training_step = (
       batch_size * unroll_length * num_minibatches * action_repeat)
@@ -221,8 +206,22 @@ def train(
       )
   ).astype(int)
 
-  max_replay_size = max_replay_size or env_step_per_training_step
-  logging.info('max_replay_size: %s', max_replay_size)
+  min_replay_size = num_training_steps_per_epoch * env_step_per_training_step // 2
+  min_replay_size = min(min_replay_size, num_timesteps)
+  max_replay_size = min_replay_size
+
+  logging.info(f'Minimum replay size: {min_replay_size}')
+
+  if min_replay_size > num_timesteps:
+    raise ValueError(
+        'No training will happen because min_replay_size >= num_timesteps')
+
+  num_prefill_actor_steps = -(-min_replay_size // num_envs) + 1
+  logging.info(f'Number of prefill actor steps: {num_prefill_actor_steps}')
+  num_prefs_per_epoch = num_prefs // num_evals 
+  logging.info(f'Number of prefs per epoch: {num_prefs_per_epoch}')
+
+  # min_replay_size = min
 
   key = jax.random.PRNGKey(seed)
   global_key, local_key = jax.random.split(key)
@@ -281,7 +280,7 @@ def train(
   make_reward_model = reward_model_networks.make_inference_fn(reward_model_network)
 
   policy_optimizer = optax.adam(learning_rate=learning_rate)
-  reward_model_optimizer = optax.adam(learning_rate=0.0005)
+  reward_model_optimizer = optax.adam(learning_rate=0.0003)
 
   dummy_obs = jnp.zeros((obs_size,))
   dummy_action = jnp.zeros((action_size,))
@@ -546,6 +545,19 @@ def train(
       # generate preference pairs
       (buffer_state), pref_data = jax.lax.scan(
           f, (buffer_state), (), length=num_prefs_per_epoch)
+      
+      def train_rm_iter(carry, unused):
+        rm_params, rm_optimizer_state = carry
+        rm_loss, rm_params, rm_optimizer_state = reward_model_update(
+        rm_params, pref_data, optimizer_state=rm_optimizer_state)
+        return (rm_params, rm_optimizer_state), rm_loss
+      
+      num_rm_iterations = 10  # Adjust this value as needed
+      (rm_params, rm_optimizer_state), rm_losses = jax.lax.scan(
+        train_rm_iter, 
+        (training_state.reward_model_params, training_state.reward_model_optimizer_state),
+        None,
+        length=num_rm_iterations)
     
       def g(carry, pref_pair):
           _ = carry
@@ -559,12 +571,12 @@ def train(
           'reward_model/pearson_correlation': jnp.mean(pearson_correlation),
       }
       
-      rm_loss, rm_params, rm_optimizer_state = reward_model_update(
-        training_state.reward_model_params,
-        pref_data, 
-        optimizer_state=training_state.reward_model_optimizer_state)
+      # rm_loss, rm_params, rm_optimizer_state = reward_model_update(
+      #   training_state.reward_model_params,
+      #   pref_data, 
+      #   optimizer_state=training_state.reward_model_optimizer_state)
       
-      metrics['reward_model/loss'] = rm_loss
+      metrics['reward_model/loss'] = jnp.mean(rm_losses)
       
       logging.info("Done training rm!!!")
 
@@ -695,6 +707,10 @@ def train(
       (training_state, env_state, buffer_state, training_metrics) = (
           training_epoch_with_timing(training_state, env_state, buffer_state, epoch_keys)
       )
+      replay_size = jnp.sum(jax.vmap(
+      replay_buffer.size)(buffer_state)) * jax.process_count()
+      logging.info('replay size after training: %s', replay_size)
+
       current_step = int(_unpmap(training_state.env_steps))
 
       key_envs = jax.vmap(
