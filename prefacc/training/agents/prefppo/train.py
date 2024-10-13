@@ -70,6 +70,17 @@ def _strip_weak_type(tree):
   return jax.tree_util.tree_map(f, tree)
 
 
+def perfect_oracle(summed_reward_s1, summed_reward_s2):
+    return jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
+
+def mistake_oracle(summed_reward_s1, summed_reward_s2, key):
+    perfect_pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
+    flip = jax.random.bernoulli(key, p=0.1)
+    jax.debug.print("flip {x}", x=flip)
+    return jax.lax.cond(flip, lambda _: [perfect_pref[1], perfect_pref[0]], lambda _: perfect_pref, ())
+
+
+
 def train(
     environment: Union[envs_v1.Env, envs.Env],
     num_timesteps: int,
@@ -90,7 +101,7 @@ def train(
     num_resets_per_eval: int = 0,
     normalize_observations: bool = False,
     reward_scaling: float = 1.0,
-    clipping_epsilon: float = 0.3, # 0.3
+    clipping_epsilon: float = 0.3,
     gae_lambda: float = 0.95,
     min_replay_size: int = 0,
     max_replay_size: Optional[int] = None,
@@ -99,8 +110,9 @@ def train(
     rm_learning_rate: float = 0.0003,
     segment_size: int = 50,
     num_prefs: int = 2000,
+    oracle_type: str = 'mistake',
     num_prefill_iterations: int = 10,
-    num_rm_batches: int = 10,
+    num_rm_batches: int = 8,
     network_factory: brax_types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
@@ -518,12 +530,12 @@ def train(
     return training_state, env_state, buffer_state, metrics  # pytype: disable=bad-return-type  # py311-upgrade
   
   def training_reward_model(
-      training_state: TrainingState, buffer_state: ReplayBufferState
+      training_state: TrainingState, buffer_state: ReplayBufferState, key: PRNGKey
   ) -> Tuple[TrainingState, ReplayBufferState, Metrics]:
       
-      
       def f(carry, unused):
-          buffer_state = carry
+          buffer_state, key = carry
+
           buffer_state, segment1 = replay_buffer.sample(buffer_state)
           buffer_state, segment2 = replay_buffer.sample(buffer_state)
 
@@ -537,15 +549,22 @@ def train(
 
           summed_reward_s1 = jnp.sum(segment1.true_reward)
           summed_reward_s2 = jnp.sum(segment2.true_reward)
-          pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
+          if oracle_type == 'perfect':
+              pref = perfect_oracle(summed_reward_s1, summed_reward_s2)
+          elif oracle_type == 'mistake':
+              key, oracle_key = jax.random.split(key)
+              pref = mistake_oracle(summed_reward_s1, summed_reward_s2, oracle_key)
+          else:
+              raise ValueError(f"Unknown oracle type {oracle_type}")
+          # pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
           pref_pair = prefacc_types.PreferencePair(segment1, segment2, pref)
 
           
-          return (buffer_state), pref_pair
+          return (buffer_state, key), pref_pair
 
       # generate preference pairs
-      (buffer_state), pref_data = jax.lax.scan(
-          f, (buffer_state), (), length=num_prefs_per_epoch)
+      (buffer_state, key), pref_data = jax.lax.scan(
+          f, (buffer_state, key), (), length=num_prefs_per_epoch)
       
       def train_rm_iter(carry, unused):
         rm_params, rm_optimizer_state = carry
@@ -684,8 +703,10 @@ def train(
     logging.info('replay size after prefill: %s', replay_size)
     
     if replay_size >= segment_size * 5:
+      rm_key, local_key = jax.random.split(local_key)
+      rm_keys = jax.random.split(rm_key, local_devices_to_use)
       (training_state, buffer_state), metrics = training_reward_model(
-          training_state, buffer_state)
+          training_state, buffer_state, rm_keys)
       logging.info('Reward model training metrics: %s', metrics)
     else:
       logging.info('Skipping reward model training due to insufficient data')
@@ -720,8 +741,10 @@ def train(
 
       # Train reward model multiple times
 
+      rm_key, local_key = jax.random.split(local_key)
+      rm_keys = jax.random.split(rm_key, local_devices_to_use)
       (training_state, buffer_state), rm_metrics = training_reward_model(
-          training_state, buffer_state)
+          training_state, buffer_state, rm_keys)
       # Track the rm_metrics
       rm_corr.append(rm_metrics['reward_model/pearson_correlation'])
       rm_loss.append(rm_metrics['reward_model/loss'])
