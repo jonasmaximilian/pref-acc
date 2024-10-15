@@ -69,16 +69,23 @@ def _strip_weak_type(tree):
     return leaf.astype(leaf.dtype)
   return jax.tree_util.tree_map(f, tree)
 
-
+# oracle functions
 def perfect_oracle(summed_reward_s1, summed_reward_s2):
     return jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
 
 def mistake_oracle(summed_reward_s1, summed_reward_s2, key):
     perfect_pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
     flip = jax.random.bernoulli(key, p=0.1)
-    jax.debug.print("flip {x}", x=flip)
     return jax.lax.cond(flip, lambda _: [perfect_pref[1], perfect_pref[0]], lambda _: perfect_pref, ())
 
+def myopic_oracle(s1_true, s2_true, gamma=0.9):
+    def sum_discounted_rewards(rewards):
+        return jnp.sum(jnp.array([gamma**i * r for i, r in enumerate(rewards)]))
+    
+    summed_r1 = sum_discounted_rewards(s1_true)
+    summed_r2 = sum_discounted_rewards(s2_true)
+    
+    return jax.lax.cond(summed_r1 > summed_r2, lambda _: [1., 0.], lambda _: [0., 1.], ())
 
 
 def train(
@@ -110,7 +117,7 @@ def train(
     rm_learning_rate: float = 0.0003,
     segment_size: int = 50,
     num_prefs: int = 2000,
-    oracle_type: str = 'mistake',
+    oracle_type: str = 'perfect',
     num_prefill_iterations: int = 10,
     num_rm_batches: int = 8,
     network_factory: brax_types.NetworkFactory[
@@ -222,6 +229,7 @@ def train(
   min_replay_size = num_training_steps_per_epoch * env_step_per_training_step // 2
   min_replay_size = min(min_replay_size, num_timesteps)
   max_replay_size = min_replay_size
+  min_replay_size = min_replay_size // 3
 
   logging.info(f'Minimum replay size: {min_replay_size}')
 
@@ -554,6 +562,8 @@ def train(
           elif oracle_type == 'mistake':
               key, oracle_key = jax.random.split(key)
               pref = mistake_oracle(summed_reward_s1, summed_reward_s2, oracle_key)
+          elif oracle_type == 'myopic':
+              pref = myopic_oracle(segment1.true_reward, segment2.true_reward)
           else:
               raise ValueError(f"Unknown oracle type {oracle_type}")
           # pref = jax.lax.cond(summed_reward_s1 > summed_reward_s2, lambda _: [1., 0.], lambda _: [0., 1.], ())
@@ -702,7 +712,7 @@ def train(
         replay_buffer.size)(buffer_state)) * jax.process_count()
     logging.info('replay size after prefill: %s', replay_size)
     
-    if replay_size >= segment_size * 5:
+    if replay_size >= segment_size:
       rm_key, local_key = jax.random.split(local_key)
       rm_keys = jax.random.split(rm_key, local_devices_to_use)
       (training_state, buffer_state), metrics = training_reward_model(
