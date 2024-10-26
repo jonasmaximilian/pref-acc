@@ -79,6 +79,7 @@ def mistake_oracle(summed_reward_s1, summed_reward_s2, key):
     return jax.lax.cond(flip, lambda _: [perfect_pref[1], perfect_pref[0]], lambda _: perfect_pref, ())
 
 def myopic_oracle(s1_true, s2_true, gamma=0.9):
+    # r1 + r2*g + r3*g**2 ... = ri*g**i
     def sum_discounted_rewards(rewards):
         return jnp.sum(jnp.array([gamma**i * r for i, r in enumerate(rewards)]))
     
@@ -724,6 +725,7 @@ def train(
   eval_rewards = list()
   rm_corr = list()
   rm_loss = list()
+  timesteps = list()
 
   training_metrics = {}
   training_walltime = 0
@@ -775,6 +777,7 @@ def train(
       policy_params_fn(current_step, make_policy, policy_params)
 
       eval_rewards.append(metrics['eval/episode_reward'])
+      timesteps.append(time.time() - xt)
 
   total_steps = current_step
   assert total_steps >= num_timesteps
@@ -804,7 +807,7 @@ def train(
   plt.savefig('pearson_corr_plot.png')
   plt.close()
 
-  logging.info(f'Pearson correlation over training: {rm_corr}')
+  # logging.info(f'Pearson correlation over training: {rm_corr}')
 
   plt.figure(figsize=(10, 6))
   plt.plot(rm_loss)
@@ -814,7 +817,7 @@ def train(
   plt.savefig('reward_model_loss_plot.png')
   plt.close()
 
-  logging.info(f'Reward model loss over training: {rm_loss}')
+  # logging.info(f'Reward model loss over training: {rm_loss}')
 
   # If there was no mistakes the training_state should still be identical on all
   # devices.
@@ -823,4 +826,16 @@ def train(
       (training_state.normalizer_params, training_state.policy_params.policy))
   logging.info('total steps: %s', total_steps)
   pmap.synchronize_hosts()
+  # Save eval_rewards and timesteps to a CSV file
+  if process_id == 0:
+    import csv
+    
+    csv_filename = 'eval_rewards_and_timesteps.csv'
+    with open(csv_filename, 'w', newline='') as csvfile:
+      writer = csv.writer(csvfile)
+      writer.writerow(['Evaluation Number', 'Reward', 'Timestep'])
+      for i, (reward, timestep) in enumerate(zip(eval_rewards, timesteps)):
+        writer.writerow([i+1, reward, timestep])
+    
+    logging.info(f'Evaluation rewards and timesteps saved to {csv_filename}')
   return (make_policy, policy_params, metrics)
